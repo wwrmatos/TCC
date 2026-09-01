@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+*.xlsx binary
+*.gpkg binary
+*.gz binary
+
+# Notebooks: diff mais legivel, sem merge automatico
+*.ipynb -merge

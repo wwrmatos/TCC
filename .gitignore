@@ -1,0 +1,22 @@
+# Dados brutos e processados (nao versionar - ver README)
+data/
+
+# Artefatos gerados
+output/
+
+# Ambiente virtual
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# Ferramentas
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
