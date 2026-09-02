@@ -1,5 +1,6 @@
 """Carga das planilhas de ocorrências da SSP-DF, uma por Região Administrativa."""
 
+import unicodedata
 from pathlib import Path
 
 import polars as pl
@@ -82,13 +83,45 @@ def parse_xlsx(path: Path) -> pl.DataFrame:
     return pl.DataFrame(records)
 
 
+def _sem_acento(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
+    )
+
+
+def _canonizar_naturezas(df: pl.DataFrame) -> pl.DataFrame:
+    """Unifica grafias divergentes da mesma natureza entre planilhas.
+
+    A SSP-DF escreve, por exemplo, `TENTATIVA DE LATROCINIO` numa RA e
+    `TENTATIVA DE LATROCÍNIO` nas demais. Sem isso o filtro dos mapas cria duas
+    categorias e cada uma esconde parte das ocorrências.
+    """
+    contagem: dict[str, dict[str, int]] = {}
+    for n in df["natureza"].drop_nulls().to_list():
+        limpo = " ".join(str(n).split()).upper()
+        chave = _sem_acento(limpo)
+        contagem.setdefault(chave, {})
+        contagem[chave][limpo] = contagem[chave].get(limpo, 0) + 1
+
+    # Grafia vencedora por chave: a mais frequente entre as planilhas.
+    canonica = {
+        chave: max(variantes.items(), key=lambda kv: kv[1])[0]
+        for chave, variantes in contagem.items()
+    }
+    de_para = {
+        n: canonica[_sem_acento(" ".join(str(n).split()).upper())]
+        for n in df["natureza"].drop_nulls().unique().to_list()
+    }
+    return df.with_columns(pl.col("natureza").replace(de_para))
+
+
 def carregar_dados_ssp_df() -> pl.DataFrame:
     dfs = [
         parse_xlsx(f)
         for f in sorted(SSP_DF_DIR.iterdir())
         if f.is_file() and f.suffix == ".xlsx"
     ]
-    df = pl.concat(dfs, how="diagonal")
+    df = _canonizar_naturezas(pl.concat(dfs, how="diagonal"))
     return df.with_columns(
         pl.col("ra").replace(RA_PARA_CD_SUBDIST).alias("cd_subdist")
     )
