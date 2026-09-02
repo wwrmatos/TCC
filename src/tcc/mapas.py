@@ -202,6 +202,18 @@ function _color(v,mx){
   return t<0.5?_lerp('#fff7ec','#fc8d59',t*2):_lerp('#fc8d59','#7f0000',(t-0.5)*2);
 }
 
+// Bloco de totais do tooltip. Com filtro parcial o destaque é o total filtrado
+// (nomeado quando só uma natureza está marcada); o total geral fica como contexto.
+function _tipTotais(sel,nats,filtered,raGrand,lines){
+  if(!sel.length) return '<br><span style="color:#888">Nenhuma natureza selecionada</span>';
+  if(sel.length===nats.length) return '<br><b>Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</b>';
+  var rotulo = sel.length===1 ? sel[0] : 'Total filtrado ('+sel.length+' naturezas)';
+  var t='<br><b>'+rotulo+': '+filtered.toLocaleString('pt-BR')+'</b>';
+  if(lines.length) t+='<hr style="margin:3px 0">'+lines.join('<br>');
+  t+='<br><span style="color:#888">Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</span>';
+  return t;
+}
+
 function cfpUpdate(){
   var sel=_sel();
 
@@ -249,15 +261,10 @@ function cfpUpdate(){
       fillOpacity: sel.length?0.75:0.3,
     });
 
-    // Tooltip: sempre mostra total geral da RA; se filtro ativo e parcial, mostra filtrado também
-    var isAll = sel.length===_nats.length;
+    // Tooltip: com filtro parcial o número em destaque é o filtrado; o total geral vira contexto.
     var tip='<b>'+nm+'</b><br><span style="color:#666">'+(_rn[cd]||'')+'</span>';
     tip+='<br>Nº delegacias: '+(_nd[cd]||0);
-    tip+='<br><b>Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</b>';
-    if(sel.length && !isAll){
-      tip+='<br>Total filtrado: <b>'+filtered.toLocaleString('pt-BR')+'</b>';
-      if(lines.length) tip+='<hr style="margin:3px 0">'+lines.join('<br>');
-    }
+    tip+=_tipTotais(sel,_nats,filtered,raGrand,lines);
 
     layer.bindTooltip(tip,{sticky:true,direction:'right'});
   });
@@ -378,6 +385,17 @@ function bfNone(){
   bfUpdate();
 }
 
+// Mesma lógica do mapa coroplético: com filtro parcial o destaque é o filtrado.
+function _bTipTotais(sel,nats,filtered,raGrand,lines){
+  if(!sel.length) return '<br><span style="color:#888">Nenhuma natureza selecionada</span>';
+  if(sel.length===nats.length) return '<br><b>Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</b>';
+  var rotulo = sel.length===1 ? sel[0] : 'Total filtrado ('+sel.length+' naturezas)';
+  var t='<br><b>'+rotulo+': '+filtered.toLocaleString('pt-BR')+'</b>';
+  if(lines.length) t+='<hr style="margin:3px 0">'+lines.join('<br>');
+  t+='<br><span style="color:#888">Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</span>';
+  return t;
+}
+
 function bfUpdate(){
   var sel=_bSel();
 
@@ -419,15 +437,10 @@ function bfUpdate(){
       opacity:     sel.length && filtered>0 ? 1 : 0.3,
     });
 
-    var isAll=sel.length===_bnats.length;
     var nm=_bcen[cd].nm;
     var tip='<b>'+nm+'</b><br><span style="color:#666">'+(_brn[cd]||'')+'</span>';
     tip+='<br>Nº delegacias: '+(_bnd[cd]||0);
-    tip+='<br><b>Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</b>';
-    if(sel.length && !isAll){
-      tip+='<br>Total filtrado: <b>'+filtered.toLocaleString('pt-BR')+'</b>';
-      if(lines.length) tip+='<hr style="margin:3px 0">'+lines.join('<br>');
-    }
+    tip+=_bTipTotais(sel,_bnats,filtered,raGrand,lines);
     _bubbles[cd].bindTooltip(tip,{sticky:true,direction:'right'});
   });
 }
