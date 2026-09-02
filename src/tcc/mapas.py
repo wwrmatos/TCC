@@ -2,8 +2,10 @@
 
 Dois mapas, ambos com um painel lateral que filtra por natureza do crime:
 
-- :func:`mapa_coropletico` — cor do polígono da RA proporcional ao total filtrado;
-- :func:`mapa_bolhas` — círculo no centroide da RA com raio proporcional ao total.
+- :func:`mapa_coropletico` — cor do polígono da RA proporcional à *taxa* de
+  ocorrências (por mil habitantes, Censo 2022);
+- :func:`mapa_bolhas` — círculo no centroide da RA com raio proporcional ao
+  total absoluto, com a taxa no tooltip para comparação.
 """
 
 import json
@@ -15,6 +17,15 @@ import polars as pl
 from branca.element import MacroElement
 from jinja2 import Template
 
+from tcc.populacao import BASE_TAXA
+
+# Prefixo do eixo "PRODUTIVIDADE POLICIAL". Tráfico, uso/porte de drogas,
+# posse de arma e localização de veículo não são vitimização: o registro nasce
+# da atuação policial, não da vítima procurando a delegacia. Somá-los à taxa
+# mediria policiamento — e, num trabalho sobre distribuição de delegacias, isso
+# é circular. Ficam disponíveis no painel, apenas desmarcados por padrão.
+EIXO_FORA_DA_TAXA = "4."
+
 
 @dataclass(frozen=True)
 class DadosMapa:
@@ -24,6 +35,9 @@ class DadosMapa:
     ra_names: dict[str, str]
     n_dps: dict[str, int]
     naturezas: list[str]
+    populacao: dict[str, int]
+    grupos: list[dict]
+    padrao: list[str]
 
 
 def preparar_dados(ssp_dp: pl.DataFrame) -> DadosMapa:
@@ -45,8 +59,38 @@ def preparar_dados(ssp_dp: pl.DataFrame) -> DadosMapa:
         for r in ssp_dp.select(["cd_subdist", "n_delegacias"]).unique().to_dicts()
     }
     naturezas = sorted(ssp_dp["natureza"].drop_nulls().unique().to_list())
+    grupos = _agrupar_por_eixo(ssp_dp)
+    padrao = [
+        n for g in grupos if not g["fora_taxa"] for n in g["naturezas"]
+    ]
+    populacao = {
+        r["cd_subdist"]: int(r["populacao"])
+        for r in ssp_dp.select(["cd_subdist", "populacao"]).unique().to_dicts()
+        if r["populacao"] is not None
+    }
 
-    return DadosMapa(crime_data, ra_names, n_dps, naturezas)
+    return DadosMapa(crime_data, ra_names, n_dps, naturezas, populacao, grupos, padrao)
+
+
+def _agrupar_por_eixo(ssp_dp: pl.DataFrame) -> list[dict]:
+    """Naturezas agrupadas pelo eixo da SSP-DF, na ordem em que a fonte os numera.
+
+    O rótulo do eixo vem com espaçamento irregular nas planilhas (`2. C.C.P. -
+    <muitos espaços> CRIMES...`), então normalizamos os espaços.
+    """
+    por_eixo: dict[str, set[str]] = {}
+    for r in ssp_dp.select(["eixo", "natureza"]).drop_nulls().unique().to_dicts():
+        eixo = " ".join(str(r["eixo"]).split())
+        por_eixo.setdefault(eixo, set()).add(r["natureza"])
+
+    return [
+        {
+            "eixo": eixo,
+            "naturezas": sorted(nats),
+            "fora_taxa": eixo.startswith(EIXO_FORA_DA_TAXA),
+        }
+        for eixo, nats in sorted(por_eixo.items())
+    ]
 
 
 # Substitui o CartoDB Positron, que passou a exigir API key.
@@ -108,6 +152,10 @@ class _CrimeFilterPanel(MacroElement):
         self.rn = json.dumps(dados.ra_names, ensure_ascii=False)
         self.nd = json.dumps(dados.n_dps, ensure_ascii=False)
         self.nats = json.dumps(dados.naturezas, ensure_ascii=False)
+        self.pop = json.dumps(dados.populacao, ensure_ascii=False)
+        self.grupos = json.dumps(dados.grupos, ensure_ascii=False)
+        self.padrao = json.dumps(dados.padrao, ensure_ascii=False)
+        self.base = BASE_TAXA
         self.gj = gj_var
         self._template = Template("""
 {% macro header(this, kwargs) %}
@@ -115,7 +163,8 @@ class _CrimeFilterPanel(MacroElement):
 #cfp{position:fixed;top:80px;right:10px;z-index:9999;background:#fff;
   border-radius:8px;padding:10px 14px;box-shadow:0 2px 10px rgba(0,0,0,.25);
   max-height:78vh;overflow-y:auto;min-width:220px;font-family:Arial,sans-serif;font-size:12px;}
-#cfp h4{margin:0 0 6px 0;font-size:13px;color:#222;}
+#cfp h4{margin:0 0 2px 0;font-size:13px;color:#222;}
+#cfpModo{font-size:10px;color:#777;margin-bottom:6px;}
 .pbtn{display:inline-block;padding:3px 8px;margin:2px 2px 6px 0;border-radius:4px;
   border:1px solid #bbb;cursor:pointer;font-size:11px;background:#f0f0f0;}
 .pbtn:hover{background:#ddd;}
@@ -124,6 +173,15 @@ class _CrimeFilterPanel(MacroElement):
 .cbr input{margin:2px 5px 0 0;cursor:pointer;flex-shrink:0;}
 .cbr label{cursor:pointer;font-size:11px;line-height:1.3;}
 .div{border:none;border-top:1px solid #eee;margin:6px 0;}
+.grp{display:flex;align-items:flex-start;margin:8px 0 3px 0;padding-top:6px;
+  border-top:1px solid #eee;}
+.grp:first-child{border-top:none;padding-top:0;margin-top:0;}
+.grp input{margin:2px 5px 0 0;cursor:pointer;flex-shrink:0;}
+.grp label{cursor:pointer;font-size:11px;font-weight:bold;color:#1d3557;line-height:1.3;}
+.grpwarn{display:block;font-weight:normal;color:#9a6700;font-size:10px;}
+.cbr{margin-left:14px;}
+#cfpWarn{display:none;margin-top:8px;padding:6px 8px;font-size:10px;line-height:1.4;
+  background:#fff8e5;border-left:3px solid #d4a72c;border-radius:4px;color:#7a5c00;}
 #cfpSum{display:none;margin-top:8px;padding:8px 10px;
   background:#f7f9fc;border-radius:6px;border-left:3px solid #457b9d;}
 #cfpGrand{font-size:13px;font-weight:bold;color:#1d3557;margin-bottom:3px;}
@@ -134,10 +192,13 @@ class _CrimeFilterPanel(MacroElement):
 {% macro html(this, kwargs) %}
 <div id="cfp">
   <h4>Natureza do crime</h4>
-  <button class="pbtn on" id="btnAll"  onclick="cfpAll()">Total (todos)</button>
+  <div id="cfpModo">Cor: taxa por {{ this.base }} habitantes</div>
+  <button class="pbtn on" id="btnPad"  onclick="cfpPadrao()">Crimes (padrão)</button>
+  <button class="pbtn"    id="btnAll"  onclick="cfpAll()">Todos</button>
   <button class="pbtn"    id="btnNone" onclick="cfpNone()">Limpar</button>
   <hr class="div">
   <div id="cfpCbs"></div>
+  <div id="cfpWarn"></div>
   <div id="cfpSum">
     <div id="cfpGrand"></div>
     <div id="cfpLines"></div>
@@ -150,7 +211,17 @@ var _cd   = {{ this.cd }};
 var _rn   = {{ this.rn }};
 var _nd   = {{ this.nd }};
 var _nats = {{ this.nats }};
+var _pop  = {{ this.pop }};
+var _grupos = {{ this.grupos }};
+var _padrao = {{ this.padrao }};
+var _base = {{ this.base }};
 var _gj   = {{ this.gj }};
+
+// Naturezas que a taxa padrão não inclui (eixo de produtividade policial).
+var _foraTaxa = {};
+_grupos.forEach(function(g){
+  if(g.fora_taxa) g.naturezas.forEach(function(n){ _foraTaxa[n]=true; });
+});
 
 // Total geral por RA (soma de todas as naturezas, fixo)
 var _raTotal = {};
@@ -159,37 +230,77 @@ Object.keys(_cd).forEach(function(cd){
   _raTotal[cd]=s;
 });
 
+// Ocorrências por _base habitantes. Sem população conhecida não há taxa.
+function _taxa(total,cd){
+  var p=_pop[cd];
+  return p ? total*_base/p : null;
+}
+function _fmtN(v){return v.toLocaleString('pt-BR');}
+function _fmtT(v){
+  return v==null ? '—'
+    : v.toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})
+      +' /'+_fmtN(_base)+' hab.';
+}
+
 (function init(){
   var c=document.getElementById('cfpCbs');
   if(!c){setTimeout(init,100);return;}
-  _nats.forEach(function(n,i){
-    var row=document.createElement('div'); row.className='cbr';
-    var cb=document.createElement('input');
-    cb.type='checkbox'; cb.id='c'+i; cb.value=n; cb.checked=true;
-    cb.onchange=function(){_sync();cfpUpdate();};
-    var lb=document.createElement('label'); lb.htmlFor='c'+i; lb.textContent=n;
-    row.appendChild(cb); row.appendChild(lb);
-    c.appendChild(row);
+  _grupos.forEach(function(g,gi){
+    var h=document.createElement('div'); h.className='grp';
+    var gcb=document.createElement('input');
+    gcb.type='checkbox'; gcb.id='g'+gi;
+    gcb.onchange=function(){cfpGrupo(gi,gcb.checked);};
+    var gl=document.createElement('label'); gl.htmlFor='g'+gi;
+    gl.appendChild(document.createTextNode(g.eixo));
+    if(g.fora_taxa){
+      var w=document.createElement('span'); w.className='grpwarn';
+      w.textContent='registro gerado pela polícia — fora da taxa por padrão';
+      gl.appendChild(w);
+    }
+    h.appendChild(gcb); h.appendChild(gl); c.appendChild(h);
+
+    g.naturezas.forEach(function(n){
+      var i=_nats.indexOf(n);
+      var row=document.createElement('div'); row.className='cbr';
+      var cb=document.createElement('input');
+      cb.type='checkbox'; cb.id='c'+i; cb.value=n;
+      cb.checked=_padrao.indexOf(n)>=0;
+      cb.onchange=function(){_sync();cfpUpdate();};
+      var lb=document.createElement('label'); lb.htmlFor='c'+i; lb.textContent=n;
+      row.appendChild(cb); row.appendChild(lb);
+      c.appendChild(row);
+    });
   });
-  cfpUpdate();
+  _sync(); cfpUpdate();
 })();
 
 function _cb(i){return document.getElementById('c'+i);}
+function _cbN(n){return _cb(_nats.indexOf(n));}
 function _sel(){return _nats.filter(function(n,i){return _cb(i)&&_cb(i).checked;});}
+
+function _marcar(nats,on){
+  nats.forEach(function(n){var c=_cbN(n); if(c)c.checked=on;});
+}
+function cfpGrupo(gi,on){ _marcar(_grupos[gi].naturezas,on); _sync(); cfpUpdate(); }
+
 function _sync(){
-  var all=_nats.every(function(n,i){return _cb(i)&&_cb(i).checked;});
-  document.getElementById('btnAll').className=all?'pbtn on':'pbtn';
+  // Estado dos checkboxes de eixo: marcado, vazio ou indeterminado.
+  _grupos.forEach(function(g,gi){
+    var m=g.naturezas.filter(function(n){var c=_cbN(n);return c&&c.checked;}).length;
+    var gcb=document.getElementById('g'+gi);
+    if(!gcb)return;
+    gcb.checked = m===g.naturezas.length;
+    gcb.indeterminate = m>0 && m<g.naturezas.length;
+  });
+
+  var sel=_sel();
+  var eq=function(a){return sel.length===a.length&&a.every(function(n){return sel.indexOf(n)>=0;});};
+  document.getElementById('btnPad').className=eq(_padrao)?'pbtn on':'pbtn';
+  document.getElementById('btnAll').className=eq(_nats)?'pbtn on':'pbtn';
 }
-function cfpAll(){
-  _nats.forEach(function(n,i){if(_cb(i))_cb(i).checked=true;});
-  document.getElementById('btnAll').className='pbtn on';
-  cfpUpdate();
-}
-function cfpNone(){
-  _nats.forEach(function(n,i){if(_cb(i))_cb(i).checked=false;});
-  document.getElementById('btnAll').className='pbtn';
-  cfpUpdate();
-}
+function cfpPadrao(){ _marcar(_nats,false); _marcar(_padrao,true); _sync(); cfpUpdate(); }
+function cfpAll(){ _marcar(_nats,true); _sync(); cfpUpdate(); }
+function cfpNone(){ _marcar(_nats,false); _sync(); cfpUpdate(); }
 
 function _hex2rgb(h){return[parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];}
 function _lerp(c1,c2,t){
@@ -202,20 +313,36 @@ function _color(v,mx){
   return t<0.5?_lerp('#fff7ec','#fc8d59',t*2):_lerp('#fc8d59','#7f0000',(t-0.5)*2);
 }
 
-// Bloco de totais do tooltip. Com filtro parcial o destaque é o total filtrado
-// (nomeado quando só uma natureza está marcada); o total geral fica como contexto.
-function _tipTotais(sel,nats,filtered,raGrand,lines){
+// Bloco de números do tooltip. O destaque é sempre a taxa — é ela que colore o
+// mapa; o total absoluto entra como contexto, porque taxa alta em RA pequena
+// pode vir de pouquíssimas ocorrências.
+function _tipTotais(sel,nats,cd,filtered,raGrand,lines){
   if(!sel.length) return '<br><span style="color:#888">Nenhuma natureza selecionada</span>';
-  if(sel.length===nats.length) return '<br><b>Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</b>';
-  var rotulo = sel.length===1 ? sel[0] : 'Total filtrado ('+sel.length+' naturezas)';
-  var t='<br><b>'+rotulo+': '+filtered.toLocaleString('pt-BR')+'</b>';
+  var ctx = function(v){return '<span style="color:#888"> ('+_fmtN(v)+' ocorr.)</span>';};
+  if(sel.length===nats.length)
+    return '<br><b>Taxa geral da RA: '+_fmtT(_taxa(raGrand,cd))+'</b>'+ctx(raGrand);
+  var rotulo = sel.length===1 ? sel[0] : 'Taxa filtrada ('+sel.length+' naturezas)';
+  var t='<br><b>'+rotulo+': '+_fmtT(_taxa(filtered,cd))+'</b>'+ctx(filtered);
   if(lines.length) t+='<hr style="margin:3px 0">'+lines.join('<br>');
-  t+='<br><span style="color:#888">Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</span>';
+  t+='<br><span style="color:#888">Taxa geral da RA: '+_fmtT(_taxa(raGrand,cd))+ctx(raGrand)+'</span>';
   return t;
 }
 
 function cfpUpdate(){
   var sel=_sel();
+
+  // Aviso quando a seleção inclui naturezas de produtividade policial: a taxa
+  // deixa de medir só vitimização.
+  var extras=sel.filter(function(n){return _foraTaxa[n];});
+  var warn=document.getElementById('cfpWarn');
+  if(warn){
+    if(extras.length){
+      warn.innerHTML='A taxa inclui '+extras.length+' natureza(s) de <b>produtividade '
+        +'policial</b>, cujo registro nasce da atuação da polícia. O valor deixa de '
+        +'medir apenas vitimização.';
+      warn.style.display='block';
+    } else { warn.style.display='none'; }
+  }
 
   // Grand total por natureza (soma sobre todas as RAs) — para o painel
   var natTotals={}, grandTotal=0;
@@ -225,21 +352,28 @@ function cfpUpdate(){
     natTotals[n]=s; grandTotal+=s;
   });
 
+  // População do DF considerada: só as RAs com dados da SSP-DF, senão a taxa
+  // agregada ficaria diluída por RAs sem ocorrências registradas.
+  var popDF=0;
+  Object.keys(_cd).forEach(function(cd){ popDF+=(_pop[cd]||0); });
+
   var sumDiv=document.getElementById('cfpSum');
   if(sel.length>0){
-    document.getElementById('cfpGrand').textContent='Total DF: '+grandTotal.toLocaleString('pt-BR');
-    var html='';
-    if(sel.length>1) sel.forEach(function(n){ html+=n+': <b>'+natTotals[n].toLocaleString('pt-BR')+'</b><br>'; });
+    document.getElementById('cfpGrand').textContent=
+      'Taxa DF: '+_fmtT(popDF?grandTotal*_base/popDF:null);
+    var html='<span style="color:#666">Total DF: '+_fmtN(grandTotal)+' ocorr.</span><br>';
+    if(sel.length>1) sel.forEach(function(n){ html+=n+': <b>'+_fmtN(natTotals[n])+'</b><br>'; });
     document.getElementById('cfpLines').innerHTML=html;
     sumDiv.style.display='block';
   } else {
     sumDiv.style.display='none';
   }
 
-  // Atualiza mapa
+  // Escala de cor: máximo da taxa filtrada entre as RAs.
   var mx=0;
   Object.keys(_cd).forEach(function(cd){
-    var s=0; sel.forEach(function(n){s+=(_cd[cd][n]||0);}); if(s>mx)mx=s;
+    var s=0; sel.forEach(function(n){s+=(_cd[cd][n]||0);});
+    var t=_taxa(s,cd); if(t!=null&&t>mx)mx=t;
   });
 
   _gj.eachLayer(function(layer){
@@ -255,16 +389,19 @@ function cfpUpdate(){
       if(sel.length>1&&v>0) lines.push('<span style="color:#555">'+n+':</span> <b>'+v+'</b>');
     });
 
+    var taxaF=_taxa(filtered,cd);
+
     layer.setStyle({
-      fillColor: sel.length?_color(filtered,mx):'#dddddd',
+      // Sem população conhecida a RA fica cinza: não há taxa para representar.
+      fillColor: sel.length&&taxaF!=null?_color(taxaF,mx):'#dddddd',
       color:'#333', weight:0.5,
-      fillOpacity: sel.length?0.75:0.3,
+      fillOpacity: sel.length&&taxaF!=null?0.75:0.3,
     });
 
-    // Tooltip: com filtro parcial o número em destaque é o filtrado; o total geral vira contexto.
     var tip='<b>'+nm+'</b><br><span style="color:#666">'+(_rn[cd]||'')+'</span>';
     tip+='<br>Nº delegacias: '+(_nd[cd]||0);
-    tip+=_tipTotais(sel,_nats,filtered,raGrand,lines);
+    tip+='<br>População: '+(_pop[cd]?_fmtN(_pop[cd]):'—');
+    tip+=_tipTotais(sel,_nats,cd,filtered,raGrand,lines);
 
     layer.bindTooltip(tip,{sticky:true,direction:'right'});
   });
@@ -283,6 +420,10 @@ class _BubbleFilterPanel(MacroElement):
         self.rn = json.dumps(dados.ra_names, ensure_ascii=False)
         self.nd = json.dumps(dados.n_dps, ensure_ascii=False)
         self.nats = json.dumps(dados.naturezas, ensure_ascii=False)
+        self.pop = json.dumps(dados.populacao, ensure_ascii=False)
+        self.grupos = json.dumps(dados.grupos, ensure_ascii=False)
+        self.padrao = json.dumps(dados.padrao, ensure_ascii=False)
+        self.base = BASE_TAXA
         self.centroids = json.dumps(centroids, ensure_ascii=False)
         self.map_var = map_var
         self._template = Template("""
@@ -300,6 +441,15 @@ class _BubbleFilterPanel(MacroElement):
 .cbr2 input{margin:2px 5px 0 0;cursor:pointer;flex-shrink:0;}
 .cbr2 label{cursor:pointer;font-size:11px;line-height:1.3;}
 .div2{border:none;border-top:1px solid #eee;margin:6px 0;}
+.grp2{display:flex;align-items:flex-start;margin:8px 0 3px 0;padding-top:6px;
+  border-top:1px solid #eee;}
+.grp2:first-child{border-top:none;padding-top:0;margin-top:0;}
+.grp2 input{margin:2px 5px 0 0;cursor:pointer;flex-shrink:0;}
+.grp2 label{cursor:pointer;font-size:11px;font-weight:bold;color:#c1121f;line-height:1.3;}
+.grpwarn2{display:block;font-weight:normal;color:#9a6700;font-size:10px;}
+.cbr2{margin-left:14px;}
+#bfpWarn{display:none;margin-top:8px;padding:6px 8px;font-size:10px;line-height:1.4;
+  background:#fff8e5;border-left:3px solid #d4a72c;border-radius:4px;color:#7a5c00;}
 #bfpSum{display:none;margin-top:8px;padding:8px 10px;
   background:#fff5f5;border-radius:6px;border-left:3px solid #e63946;}
 #bfpGrand{font-size:13px;font-weight:bold;color:#c1121f;margin-bottom:3px;}
@@ -310,10 +460,12 @@ class _BubbleFilterPanel(MacroElement):
 {% macro html(this, kwargs) %}
 <div id="bfp">
   <h4>Natureza do crime</h4>
-  <button class="pbtn2 on" id="bAll"  onclick="bfAll()">Total (todos)</button>
+  <button class="pbtn2 on" id="bPad"  onclick="bfPadrao()">Crimes (padrão)</button>
+  <button class="pbtn2"    id="bAll"  onclick="bfAll()">Todos</button>
   <button class="pbtn2"    id="bNone" onclick="bfNone()">Limpar</button>
   <hr class="div2">
   <div id="bfpCbs"></div>
+  <div id="bfpWarn"></div>
   <div id="bfpSum">
     <div id="bfpGrand"></div>
     <div id="bfpLines"></div>
@@ -326,7 +478,27 @@ var _bcd   = {{ this.cd }};
 var _brn   = {{ this.rn }};
 var _bnd   = {{ this.nd }};
 var _bnats = {{ this.nats }};
+var _bpop  = {{ this.pop }};
+var _bgrupos = {{ this.grupos }};
+var _bpadrao = {{ this.padrao }};
+var _bbase = {{ this.base }};
+
+var _bForaTaxa = {};
+_bgrupos.forEach(function(g){
+  if(g.fora_taxa) g.naturezas.forEach(function(n){ _bForaTaxa[n]=true; });
+});
 var _bcen  = {{ this.centroids }};
+
+function _bTaxa(total,cd){
+  var p=_bpop[cd];
+  return p ? total*_bbase/p : null;
+}
+function _bFmtN(v){return v.toLocaleString('pt-BR');}
+function _bFmtT(v){
+  return v==null ? '—'
+    : v.toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})
+      +' /'+_bFmtN(_bbase)+' hab.';
+}
 var _bmap  = {{ this.map_var }};
 
 var MIN_R = 4, MAX_R = 38;
@@ -356,48 +528,90 @@ Object.keys(_bcd).forEach(function(cd){
 function bfInitCbs(){
   var c=document.getElementById('bfpCbs');
   if(!c){setTimeout(bfInitCbs,100);return;}
-  _bnats.forEach(function(n,i){
-    var row=document.createElement('div'); row.className='cbr2';
-    var cb=document.createElement('input');
-    cb.type='checkbox'; cb.id='b'+i; cb.value=n; cb.checked=true;
-    cb.onchange=function(){_bSync();bfUpdate();};
-    var lb=document.createElement('label'); lb.htmlFor='b'+i; lb.textContent=n;
-    row.appendChild(cb); row.appendChild(lb);
-    c.appendChild(row);
+  _bgrupos.forEach(function(g,gi){
+    var h=document.createElement('div'); h.className='grp2';
+    var gcb=document.createElement('input');
+    gcb.type='checkbox'; gcb.id='bg'+gi;
+    gcb.onchange=function(){bfGrupo(gi,gcb.checked);};
+    var gl=document.createElement('label'); gl.htmlFor='bg'+gi;
+    gl.appendChild(document.createTextNode(g.eixo));
+    if(g.fora_taxa){
+      var w=document.createElement('span'); w.className='grpwarn2';
+      w.textContent='registro gerado pela polícia — fora da taxa por padrão';
+      gl.appendChild(w);
+    }
+    h.appendChild(gcb); h.appendChild(gl); c.appendChild(h);
+
+    g.naturezas.forEach(function(n){
+      var i=_bnats.indexOf(n);
+      var row=document.createElement('div'); row.className='cbr2';
+      var cb=document.createElement('input');
+      cb.type='checkbox'; cb.id='b'+i; cb.value=n;
+      cb.checked=_bpadrao.indexOf(n)>=0;
+      cb.onchange=function(){_bSync();bfUpdate();};
+      var lb=document.createElement('label'); lb.htmlFor='b'+i; lb.textContent=n;
+      row.appendChild(cb); row.appendChild(lb);
+      c.appendChild(row);
+    });
   });
-  bfUpdate();
+  _bSync(); bfUpdate();
 }
 
 function _bcb(i){return document.getElementById('b'+i);}
+function _bcbN(n){return _bcb(_bnats.indexOf(n));}
 function _bSel(){return _bnats.filter(function(n,i){return _bcb(i)&&_bcb(i).checked;});}
-function _bSync(){
-  var all=_bnats.every(function(n,i){return _bcb(i)&&_bcb(i).checked;});
-  document.getElementById('bAll').className=all?'pbtn2 on':'pbtn2';
-}
-function bfAll(){
-  _bnats.forEach(function(n,i){if(_bcb(i))_bcb(i).checked=true;});
-  document.getElementById('bAll').className='pbtn2 on';
-  bfUpdate();
-}
-function bfNone(){
-  _bnats.forEach(function(n,i){if(_bcb(i))_bcb(i).checked=false;});
-  document.getElementById('bAll').className='pbtn2';
-  bfUpdate();
-}
 
-// Mesma lógica do mapa coroplético: com filtro parcial o destaque é o filtrado.
-function _bTipTotais(sel,nats,filtered,raGrand,lines){
+function _bMarcar(nats,on){
+  nats.forEach(function(n){var c=_bcbN(n); if(c)c.checked=on;});
+}
+function bfGrupo(gi,on){ _bMarcar(_bgrupos[gi].naturezas,on); _bSync(); bfUpdate(); }
+
+function _bSync(){
+  _bgrupos.forEach(function(g,gi){
+    var m=g.naturezas.filter(function(n){var c=_bcbN(n);return c&&c.checked;}).length;
+    var gcb=document.getElementById('bg'+gi);
+    if(!gcb)return;
+    gcb.checked = m===g.naturezas.length;
+    gcb.indeterminate = m>0 && m<g.naturezas.length;
+  });
+  var sel=_bSel();
+  var eq=function(a){return sel.length===a.length&&a.every(function(n){return sel.indexOf(n)>=0;});};
+  document.getElementById('bPad').className=eq(_bpadrao)?'pbtn2 on':'pbtn2';
+  document.getElementById('bAll').className=eq(_bnats)?'pbtn2 on':'pbtn2';
+}
+function bfPadrao(){ _bMarcar(_bnats,false); _bMarcar(_bpadrao,true); _bSync(); bfUpdate(); }
+function bfAll(){ _bMarcar(_bnats,true); _bSync(); bfUpdate(); }
+function bfNone(){ _bMarcar(_bnats,false); _bSync(); bfUpdate(); }
+
+// Aqui o raio é o volume absoluto, então o destaque é o total; a taxa entra
+// logo abaixo para permitir comparar com o coroplético.
+function _bTipTotais(sel,nats,cd,filtered,raGrand,lines){
   if(!sel.length) return '<br><span style="color:#888">Nenhuma natureza selecionada</span>';
-  if(sel.length===nats.length) return '<br><b>Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</b>';
+  var taxaLinha = function(v){
+    return '<br><span style="color:#888">Taxa: '+_bFmtT(_bTaxa(v,cd))+'</span>';
+  };
+  if(sel.length===nats.length)
+    return '<br><b>Total geral da RA: '+_bFmtN(raGrand)+'</b>'+taxaLinha(raGrand);
   var rotulo = sel.length===1 ? sel[0] : 'Total filtrado ('+sel.length+' naturezas)';
-  var t='<br><b>'+rotulo+': '+filtered.toLocaleString('pt-BR')+'</b>';
+  var t='<br><b>'+rotulo+': '+_bFmtN(filtered)+'</b>'+taxaLinha(filtered);
   if(lines.length) t+='<hr style="margin:3px 0">'+lines.join('<br>');
-  t+='<br><span style="color:#888">Total geral da RA: '+raGrand.toLocaleString('pt-BR')+'</span>';
+  t+='<br><span style="color:#888">Total geral da RA: '+_bFmtN(raGrand)
+    +' &middot; taxa '+_bFmtT(_bTaxa(raGrand,cd))+'</span>';
   return t;
 }
 
 function bfUpdate(){
   var sel=_bSel();
+
+  var extras=sel.filter(function(n){return _bForaTaxa[n];});
+  var warn=document.getElementById('bfpWarn');
+  if(warn){
+    if(extras.length){
+      warn.innerHTML='Inclui '+extras.length+' natureza(s) de <b>produtividade policial</b>, '
+        +'cujo registro nasce da atuação da polícia.';
+      warn.style.display='block';
+    } else { warn.style.display='none'; }
+  }
 
   // Painel: totais por natureza sobre todo DF
   var natTotals={}, grandTotal=0;
@@ -440,7 +654,8 @@ function bfUpdate(){
     var nm=_bcen[cd].nm;
     var tip='<b>'+nm+'</b><br><span style="color:#666">'+(_brn[cd]||'')+'</span>';
     tip+='<br>Nº delegacias: '+(_bnd[cd]||0);
-    tip+=_bTipTotais(sel,_bnats,filtered,raGrand,lines);
+    tip+='<br>População: '+(_bpop[cd]?_bFmtN(_bpop[cd]):'—');
+    tip+=_bTipTotais(sel,_bnats,cd,filtered,raGrand,lines);
     _bubbles[cd].bindTooltip(tip,{sticky:true,direction:'right'});
   });
 }
@@ -454,7 +669,7 @@ def mapa_coropletico(
     dp_joined: gpd.GeoDataFrame,
     dados: DadosMapa,
 ) -> folium.Map:
-    """Mapa com a RA colorida conforme o total de ocorrências filtrado."""
+    """Mapa com a RA colorida conforme a taxa de ocorrências filtrada."""
     mapa = mapa_base(gdf)
 
     geojson_layer = folium.GeoJson(

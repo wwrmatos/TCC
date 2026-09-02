@@ -34,6 +34,7 @@ RA_PARA_CD_SUBDIST: dict[str, str] = {
     "RA XXII - SUDOESTE":           "53001080535",  # Sudoeste/Octogonal
     "RA XXIII - VARJÃO":            "53001080543",
     "RA XXIV - PARK WAY":           "53001080542",
+    "RA XXV - SCIA/ESTRUTURAL":     "53001080534",
     "RA XXVI - SOBRADINHO II":      "53001080544",
     "RA XXVII - JARDIM BOTÂNICO":   "53001080540",
     "RA XXVIII - ITAPOÃ":           "53001080538",

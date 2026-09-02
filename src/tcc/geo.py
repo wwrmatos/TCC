@@ -8,6 +8,9 @@ from shapely.geometry import Point
 from tcc.paths import PLANILHA_TCC, SETORES_GPKG
 
 CRS_WGS84 = "epsg:4326"
+# SIRGAS 2000 / UTM 23S — projetado, cobre o DF. Centroide calculado em graus
+# sai deslocado, então reprojetamos antes de tirá-lo.
+CRS_UTM_DF = "epsg:31983"
 
 # Typo presente na planilha de origem.
 COLUNA_COORDENADAS = "Latitude/Logintude"
@@ -78,8 +81,9 @@ def juntar_ssp_delegacias(ssp: pl.DataFrame, dp_joined: gpd.GeoDataFrame) -> pl.
 def centroides_por_ra(gdf_ra: gpd.GeoDataFrame) -> dict[str, dict]:
     """Centroide de cada RA, indexado por `CD_SUBDIST`."""
     c = gdf_ra.copy()
-    c["lat"] = c.geometry.centroid.y
-    c["lon"] = c.geometry.centroid.x
+    centroides = c.geometry.to_crs(CRS_UTM_DF).centroid.to_crs(CRS_WGS84)
+    c["lat"] = centroides.y
+    c["lon"] = centroides.x
     return {
         row["CD_SUBDIST"]: {"lat": row["lat"], "lon": row["lon"], "nm": row["NM_SUBDIST"]}
         for _, row in c.iterrows()
