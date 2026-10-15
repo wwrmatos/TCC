@@ -45,6 +45,20 @@ RA_PARA_CD_SUBDIST: dict[str, str] = {
     "SOL NASCENTE":                 "53001080531",  # Sol Nascente/Pôr do Sol
 }
 
+# Número oficial da RA (coluna `ra_numero` de `ssp_df_ra_consolidado.csv`) →
+# subdistrito do IBGE. A RA 0 (o DF inteiro) não tem subdistrito.
+RA_NUMERO_PARA_CD_SUBDIST: dict[int, str] = {
+    1: "53001080506", 2: "53001080507", 3: "53001080508", 4: "53001080509",
+    5: "53001080510", 6: "53001080511", 7: "53001080512", 8: "53001080514",
+    9: "53001080515", 10: "53001080516", 11: "53001080517", 12: "53001080518",
+    13: "53001080525", 14: "53001080530", 15: "53001080520", 16: "53001080523",
+    17: "53001080513", 18: "53001080521", 19: "53001080519", 20: "53001080536",
+    21: "53001080541", 22: "53001080535", 23: "53001080543", 24: "53001080542",
+    25: "53001080534", 26: "53001080544", 27: "53001080540", 28: "53001080538",
+    29: "53001080533", 30: "53001080537", 31: "53001080539", 32: "53001080531",
+    33: "53001080532",
+}
+
 
 def parse_xlsx(path: Path) -> pl.DataFrame:
     raw = pl.read_excel(path, infer_schema_length=None)
@@ -124,5 +138,7 @@ def carregar_dados_ssp_df() -> pl.DataFrame:
     ]
     df = _canonizar_naturezas(pl.concat(dfs, how="diagonal"))
     return df.with_columns(
-        pl.col("ra").replace(RA_PARA_CD_SUBDIST).alias("cd_subdist")
+        pl.col("ra").replace(RA_PARA_CD_SUBDIST).alias("cd_subdist"),
+        # "RA IX - CEILÂNDIA" → "CEILÂNDIA". O código já vem do nome completo acima.
+        pl.col("ra").str.replace(r"^RA [IVXL]+ - ", ""),
     )
