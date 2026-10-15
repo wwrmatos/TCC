@@ -5,6 +5,7 @@ description = "TCC — criminalidade e distribuição de delegacias no Distrito 
 requires-python = ">=3.13"
 dependencies = [
     "branca>=0.8.2",
+    "dash>=4.4.1",
     "fastexcel>=0.20.2",
     "folium>=0.20.0",
     "geopandas>=1.1.3",

@@ -38,6 +38,17 @@ class DadosMapa:
     populacao: dict[str, int]
     grupos: list[dict]
     padrao: list[str]
+    # Naturezas marcadas ao abrir o mapa; `None` abre com o `padrao`. O painel
+    # Dash usa isto para abrir o mapa já com a seleção dos seus filtros.
+    selecao: list[str] | None = None
+    # População mostrada no tooltip, quando difere do denominador da taxa. Com
+    # vários anos, o painel passa em `populacao` a soma das populações de cada
+    # ano (a taxa sai como média anual) e aqui a do último ano.
+    populacao_exibida: dict[str, int] | None = None
+
+    @property
+    def selecao_inicial(self) -> list[str]:
+        return self.padrao if self.selecao is None else self.selecao
 
 
 def preparar_dados(ssp_dp: pl.DataFrame) -> DadosMapa:
@@ -101,10 +112,41 @@ _ESRI_ATTR = (
 )
 
 
-def mapa_base(gdf: gpd.GeoDataFrame, zoom_start: int = 10) -> folium.Map:
-    centro = gdf.geometry.union_all().centroid
+class _Enquadrar(MacroElement):
+    """Enquadra os limites no mapa e reenquadra quando o contêiner muda de tamanho.
+
+    O `fit_bounds` do folium roda uma vez só, no carregamento. No painel o mapa
+    fica num iframe que nasce escondido (aba com `display:none`), com 0 px: o
+    Leaflet calcula o zoom máximo e o mantém ao mostrar a aba.
+    """
+
+    def __init__(self, limites: list[list[float]]):
+        super().__init__()
+        self._name = "Enquadrar"
+        self.limites = json.dumps(limites)
+        self._template = Template("""
+{% macro script(this, kwargs) %}
+(function(){
+  var m = {{ this._parent.get_name() }}, b = {{ this.limites }};
+  function ajustar(){
+    var el = m.getContainer();
+    if(!el.clientWidth || !el.clientHeight) return;
+    m.invalidateSize();
+    m.fitBounds(b, {padding:[10,10]});
+  }
+  ajustar();
+  if(window.ResizeObserver) new ResizeObserver(ajustar).observe(m.getContainer());
+  else window.addEventListener('resize', ajustar);
+})();
+{% endmacro %}
+""")
+
+
+def mapa_base(gdf: gpd.GeoDataFrame) -> folium.Map:
+    x0, y0, x1, y1 = gdf.total_bounds
     # tiles=None: passar a URL direto no Map faz o controle de camadas usá-la como rótulo.
-    mapa = folium.Map(location=[centro.y, centro.x], zoom_start=zoom_start, tiles=None)
+    mapa = folium.Map(location=[(y0 + y1) / 2, (x0 + x1) / 2], zoom_start=10, tiles=None)
+    _Enquadrar([[y0, x0], [y1, x1]]).add_to(mapa)
     folium.TileLayer(
         tiles=f"{_ESRI_CANVAS}/World_Light_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
         attr=_ESRI_ATTR,
@@ -145,16 +187,19 @@ def _camada_delegacias(dp_joined: gpd.GeoDataFrame, radius: int) -> folium.Featu
 class _CrimeFilterPanel(MacroElement):
     """Painel de filtros do mapa coroplético."""
 
-    def __init__(self, dados: DadosMapa, gj_var: str):
+    def __init__(self, dados: DadosMapa, gj_var: str, aberto: bool = True):
         super().__init__()
+        self.aberto = aberto
         self._name = "CrimeFilterPanel"
         self.cd = json.dumps(dados.crime_data, ensure_ascii=False)
         self.rn = json.dumps(dados.ra_names, ensure_ascii=False)
         self.nd = json.dumps(dados.n_dps, ensure_ascii=False)
         self.nats = json.dumps(dados.naturezas, ensure_ascii=False)
         self.pop = json.dumps(dados.populacao, ensure_ascii=False)
+        self.pop_exib = json.dumps(dados.populacao_exibida, ensure_ascii=False)
         self.grupos = json.dumps(dados.grupos, ensure_ascii=False)
         self.padrao = json.dumps(dados.padrao, ensure_ascii=False)
+        self.sel0 = json.dumps(dados.selecao_inicial, ensure_ascii=False)
         self.base = BASE_TAXA
         self.gj = gj_var
         self._template = Template("""
@@ -163,7 +208,12 @@ class _CrimeFilterPanel(MacroElement):
 #cfp{position:fixed;top:80px;right:10px;z-index:9999;background:#fff;
   border-radius:8px;padding:10px 14px;box-shadow:0 2px 10px rgba(0,0,0,.25);
   max-height:78vh;overflow-y:auto;min-width:220px;font-family:Arial,sans-serif;font-size:12px;}
-#cfp h4{margin:0 0 2px 0;font-size:13px;color:#222;}
+#cfp h4{margin:0 0 2px 0;font-size:13px;color:#222;cursor:pointer;user-select:none;}
+#cfp h4::after{content:' \\25BE';color:#777;}
+#cfp.fechado{min-width:0;padding:6px 10px;}
+#cfp.fechado h4{margin:0;}
+#cfp.fechado h4::after{content:' \\25B8';}
+#cfp.fechado .corpo{display:none;}
 #cfpModo{font-size:10px;color:#777;margin-bottom:6px;}
 .pbtn{display:inline-block;padding:3px 8px;margin:2px 2px 6px 0;border-radius:4px;
   border:1px solid #bbb;cursor:pointer;font-size:11px;background:#f0f0f0;}
@@ -190,8 +240,9 @@ class _CrimeFilterPanel(MacroElement):
 {% endmacro %}
 
 {% macro html(this, kwargs) %}
-<div id="cfp">
-  <h4>Natureza do crime</h4>
+<div id="cfp"{% if not this.aberto %} class="fechado"{% endif %}>
+  <h4 onclick="this.parentNode.classList.toggle('fechado')">Natureza do crime</h4>
+  <div class="corpo">
   <div id="cfpModo">Cor: taxa por {{ this.base }} habitantes</div>
   <button class="pbtn on" id="btnPad"  onclick="cfpPadrao()">Crimes (padrão)</button>
   <button class="pbtn"    id="btnAll"  onclick="cfpAll()">Todos</button>
@@ -203,6 +254,7 @@ class _CrimeFilterPanel(MacroElement):
     <div id="cfpGrand"></div>
     <div id="cfpLines"></div>
   </div>
+  </div>
 </div>
 {% endmacro %}
 
@@ -212,8 +264,10 @@ var _rn   = {{ this.rn }};
 var _nd   = {{ this.nd }};
 var _nats = {{ this.nats }};
 var _pop  = {{ this.pop }};
+var _popExib = {{ this.pop_exib }} || _pop;
 var _grupos = {{ this.grupos }};
 var _padrao = {{ this.padrao }};
+var _sel0   = {{ this.sel0 }};
 var _base = {{ this.base }};
 var _gj   = {{ this.gj }};
 
@@ -264,7 +318,7 @@ function _fmtT(v){
       var row=document.createElement('div'); row.className='cbr';
       var cb=document.createElement('input');
       cb.type='checkbox'; cb.id='c'+i; cb.value=n;
-      cb.checked=_padrao.indexOf(n)>=0;
+      cb.checked=_sel0.indexOf(n)>=0;
       cb.onchange=function(){_sync();cfpUpdate();};
       var lb=document.createElement('label'); lb.htmlFor='c'+i; lb.textContent=n;
       row.appendChild(cb); row.appendChild(lb);
@@ -400,7 +454,7 @@ function cfpUpdate(){
 
     var tip='<b>'+nm+'</b><br><span style="color:#666">'+(_rn[cd]||'')+'</span>';
     tip+='<br>Nº delegacias: '+(_nd[cd]||0);
-    tip+='<br>População: '+(_pop[cd]?_fmtN(_pop[cd]):'—');
+    tip+='<br>População: '+(_popExib[cd]?_fmtN(_popExib[cd]):'—');
     tip+=_tipTotais(sel,_nats,cd,filtered,raGrand,lines);
 
     layer.bindTooltip(tip,{sticky:true,direction:'right'});
@@ -413,16 +467,21 @@ function cfpUpdate(){
 class _BubbleFilterPanel(MacroElement):
     """Painel de filtros do mapa de bolhas."""
 
-    def __init__(self, dados: DadosMapa, centroids: dict[str, dict], map_var: str):
+    def __init__(
+        self, dados: DadosMapa, centroids: dict[str, dict], map_var: str, aberto: bool = True
+    ):
         super().__init__()
+        self.aberto = aberto
         self._name = "BubbleFilterPanel"
         self.cd = json.dumps(dados.crime_data, ensure_ascii=False)
         self.rn = json.dumps(dados.ra_names, ensure_ascii=False)
         self.nd = json.dumps(dados.n_dps, ensure_ascii=False)
         self.nats = json.dumps(dados.naturezas, ensure_ascii=False)
         self.pop = json.dumps(dados.populacao, ensure_ascii=False)
+        self.pop_exib = json.dumps(dados.populacao_exibida, ensure_ascii=False)
         self.grupos = json.dumps(dados.grupos, ensure_ascii=False)
         self.padrao = json.dumps(dados.padrao, ensure_ascii=False)
+        self.sel0 = json.dumps(dados.selecao_inicial, ensure_ascii=False)
         self.base = BASE_TAXA
         self.centroids = json.dumps(centroids, ensure_ascii=False)
         self.map_var = map_var
@@ -432,7 +491,12 @@ class _BubbleFilterPanel(MacroElement):
 #bfp{position:fixed;top:80px;right:10px;z-index:9999;background:#fff;
   border-radius:8px;padding:10px 14px;box-shadow:0 2px 10px rgba(0,0,0,.25);
   max-height:78vh;overflow-y:auto;min-width:220px;font-family:Arial,sans-serif;font-size:12px;}
-#bfp h4{margin:0 0 6px 0;font-size:13px;color:#222;}
+#bfp h4{margin:0 0 6px 0;font-size:13px;color:#222;cursor:pointer;user-select:none;}
+#bfp h4::after{content:' \\25BE';color:#777;}
+#bfp.fechado{min-width:0;padding:6px 10px;}
+#bfp.fechado h4{margin:0;}
+#bfp.fechado h4::after{content:' \\25B8';}
+#bfp.fechado .corpo{display:none;}
 .pbtn2{display:inline-block;padding:3px 8px;margin:2px 2px 6px 0;border-radius:4px;
   border:1px solid #bbb;cursor:pointer;font-size:11px;background:#f0f0f0;}
 .pbtn2:hover{background:#ddd;}
@@ -458,8 +522,9 @@ class _BubbleFilterPanel(MacroElement):
 {% endmacro %}
 
 {% macro html(this, kwargs) %}
-<div id="bfp">
-  <h4>Natureza do crime</h4>
+<div id="bfp"{% if not this.aberto %} class="fechado"{% endif %}>
+  <h4 onclick="this.parentNode.classList.toggle('fechado')">Natureza do crime</h4>
+  <div class="corpo">
   <button class="pbtn2 on" id="bPad"  onclick="bfPadrao()">Crimes (padrão)</button>
   <button class="pbtn2"    id="bAll"  onclick="bfAll()">Todos</button>
   <button class="pbtn2"    id="bNone" onclick="bfNone()">Limpar</button>
@@ -470,6 +535,7 @@ class _BubbleFilterPanel(MacroElement):
     <div id="bfpGrand"></div>
     <div id="bfpLines"></div>
   </div>
+  </div>
 </div>
 {% endmacro %}
 
@@ -479,8 +545,10 @@ var _brn   = {{ this.rn }};
 var _bnd   = {{ this.nd }};
 var _bnats = {{ this.nats }};
 var _bpop  = {{ this.pop }};
+var _bpopExib = {{ this.pop_exib }} || _bpop;
 var _bgrupos = {{ this.grupos }};
 var _bpadrao = {{ this.padrao }};
+var _bsel0   = {{ this.sel0 }};
 var _bbase = {{ this.base }};
 
 var _bForaTaxa = {};
@@ -547,7 +615,7 @@ function bfInitCbs(){
       var row=document.createElement('div'); row.className='cbr2';
       var cb=document.createElement('input');
       cb.type='checkbox'; cb.id='b'+i; cb.value=n;
-      cb.checked=_bpadrao.indexOf(n)>=0;
+      cb.checked=_bsel0.indexOf(n)>=0;
       cb.onchange=function(){_bSync();bfUpdate();};
       var lb=document.createElement('label'); lb.htmlFor='b'+i; lb.textContent=n;
       row.appendChild(cb); row.appendChild(lb);
@@ -654,7 +722,7 @@ function bfUpdate(){
     var nm=_bcen[cd].nm;
     var tip='<b>'+nm+'</b><br><span style="color:#666">'+(_brn[cd]||'')+'</span>';
     tip+='<br>Nº delegacias: '+(_bnd[cd]||0);
-    tip+='<br>População: '+(_bpop[cd]?_bFmtN(_bpop[cd]):'—');
+    tip+='<br>População: '+(_bpopExib[cd]?_bFmtN(_bpopExib[cd]):'—');
     tip+=_bTipTotais(sel,_bnats,cd,filtered,raGrand,lines);
     _bubbles[cd].bindTooltip(tip,{sticky:true,direction:'right'});
   });
@@ -668,8 +736,12 @@ def mapa_coropletico(
     gdf_ra: gpd.GeoDataFrame,
     dp_joined: gpd.GeoDataFrame,
     dados: DadosMapa,
+    painel_aberto: bool = True,
 ) -> folium.Map:
-    """Mapa com a RA colorida conforme a taxa de ocorrências filtrada."""
+    """Mapa com a RA colorida conforme a taxa de ocorrências filtrada.
+
+    `painel_aberto=False` abre o painel de filtros recolhido (útil em iframes).
+    """
     mapa = mapa_base(gdf)
 
     geojson_layer = folium.GeoJson(
@@ -686,7 +758,7 @@ def mapa_coropletico(
 
     _camada_delegacias(dp_joined, radius=6).add_to(mapa)
     folium.LayerControl(collapsed=False).add_to(mapa)
-    _CrimeFilterPanel(dados, geojson_layer.get_name()).add_to(mapa)
+    _CrimeFilterPanel(dados, geojson_layer.get_name(), painel_aberto).add_to(mapa)
 
     return mapa
 
@@ -697,8 +769,12 @@ def mapa_bolhas(
     dp_joined: gpd.GeoDataFrame,
     dados: DadosMapa,
     centroids: dict[str, dict],
+    painel_aberto: bool = True,
 ) -> folium.Map:
-    """Mapa com uma bolha por RA, de raio proporcional ao total filtrado."""
+    """Mapa com uma bolha por RA, de raio proporcional ao total filtrado.
+
+    `painel_aberto=False` abre o painel de filtros recolhido (útil em iframes).
+    """
     mapa = mapa_base(gdf)
 
     folium.GeoJson(
@@ -714,6 +790,6 @@ def mapa_bolhas(
 
     _camada_delegacias(dp_joined, radius=5).add_to(mapa)
     folium.LayerControl(collapsed=False).add_to(mapa)
-    _BubbleFilterPanel(dados, centroids, mapa.get_name()).add_to(mapa)
+    _BubbleFilterPanel(dados, centroids, mapa.get_name(), painel_aberto).add_to(mapa)
 
     return mapa

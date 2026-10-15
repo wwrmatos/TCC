@@ -17,7 +17,7 @@ from tcc.geo import (
     juntar_ssp_delegacias,
 )
 from tcc.mapas import mapa_bolhas, mapa_coropletico, preparar_dados
-from tcc.paths import OUTPUT_DIR
+from tcc.paths import OUTPUT_DIR, PROCESSED_DIR
 from tcc.populacao import juntar_populacao
 from tcc.ssp_df import carregar_dados_ssp_df
 
@@ -43,6 +43,10 @@ def main(abrir: bool = False) -> None:
     sem_pop = ssp_dp.filter(ssp_dp["populacao"].is_null())["ra"].unique().to_list()
     if sem_pop:
         print(f"Sem população no CSV (ficam cinza no mapa): {', '.join(sorted(sem_pop))}")
+
+    PROCESSED_DIR.mkdir(exist_ok=True)
+    ssp_dp.write_csv(PROCESSED_DIR / "ssp_dp.csv")
+    print(f"Dados dos mapas salvos em: {PROCESSED_DIR / 'ssp_dp.csv'}")
 
     dados = preparar_dados(ssp_dp)
 
