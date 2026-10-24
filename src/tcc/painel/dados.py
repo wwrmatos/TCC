@@ -11,7 +11,7 @@ import geopandas as gpd
 import polars as pl
 
 from tcc.geo import carregar_setores, centroides_por_ra, delegacias_com_subdistrito, dissolver_por_ra
-from tcc.mapas import EIXO_FORA_DA_TAXA
+from tcc.mapas import EIXO_FORA_DA_TAXA, EIXO_JA_EM_HOMICIDIO
 from tcc.paths import MJ_CENSO_GEO_PARQUET, SSP_RA_GEO_PARQUET
 from tcc.populacao import RAS_DESMEMBRADAS
 
@@ -69,6 +69,35 @@ CATEGORIAS_MJ: dict[str, list[str | tuple[str, list[str]]]] = {
         "Apreensão de Maconha",
     ],
 }
+
+# Nomes mostrados no painel. Os eventos que existem nas duas fontes têm o mesmo
+# nome nas duas abas; quando a SSP-DF conta outra coisa com o mesmo nome (o
+# HOMICÍDIO e a TENTATIVA DE HOMICÍDIO das RAs incluem os feminicídios, que o
+# Sinesp separa), o nome diz isso. O que só existe numa fonte fica como está,
+# só em caixa normal na SSP-DF.
+NOMES_MJ: dict[str, str] = {
+    "Roubo seguido de morte (latrocínio)": "Latrocínio",
+}
+NOMES_SSP: dict[str, str] = {
+    "HOMICÍDIO": "Homicídio doloso (inclui feminicídio)",
+    "FEMINICÍDIO": "Feminicídio",
+    "LATROCÍNIO": "Latrocínio",
+    "LESÃO CORPORAL SEG. DE MORTE": "Lesão corporal seguida de morte",
+    "TENTATIVA DE HOMICÍDIO": "Tentativa de homicídio (inclui tentativa de feminicídio)",
+    "ESTUPRO": "Estupro",
+    "ESTUPRO DE VULNERÁVEL": "Estupro de vulnerável",
+    "ROUBO DE VEÍCULO": "Roubo de veículo",
+    "TRÁFICO DE DROGAS": "Tráfico de drogas",
+    # Só na SSP-DF.
+    "LOCALIZAÇÃO DE VEICULO FURTADO OU ROUBADO": "Localização de veículo furtado ou roubado",
+}
+HOMICIDIO_SSP = NOMES_SSP["HOMICÍDIO"]
+
+
+def _nome_ssp(natureza: str) -> str:
+    """"ROUBO A TRANSEUNTE" → "Roubo a transeunte", ou o nome de :data:`NOMES_SSP`."""
+    return NOMES_SSP.get(natureza, natureza.capitalize())
+
 
 # Tolerância do simplify (graus) nos polígonos das RAs: o mapa folium vai
 # inteiro para o navegador a cada troca de filtro, e a malha dos setores
@@ -207,6 +236,17 @@ def carregar_mj() -> BaseMJ:
         ),
     ])
     painel = simples | set(grupos)
+
+    # Nomes do painel (:data:`NOMES_MJ`), daqui em diante.
+    def nome(ev: str) -> str:
+        return NOMES_MJ.get(ev, ev)
+
+    fatos = fatos.with_columns(pl.col("evento").replace(NOMES_MJ))
+    categorias = {cat: [nome(ev) for ev in evs] for cat, evs in categorias.items()}
+    grupos = {nome(g): [nome(m) for m in ms] for g, ms in grupos.items()}
+    unidade = {nome(ev): u for ev, u in unidade.items()}
+    municipal = {nome(ev) for ev in municipal}
+    painel = {nome(ev) for ev in painel}
     return BaseMJ(
         fatos=fatos,
         municipios=municipios,
@@ -248,9 +288,11 @@ class BaseSSP:
     anos_natureza: dict[str, set[int]]
     """Natureza → anos em que ela aparece nos balanços das RAs."""
     grupos: list[dict]
-    """Naturezas por eixo, na ordem da fonte (`eixo`, `naturezas`, `fora_taxa`)."""
+    """Naturezas por eixo, na ordem da fonte (`eixo`, `naturezas`, `fora_taxa`,
+    `ja_em_homicidio`)."""
     padrao: list[str]
-    """Naturezas de vitimização: todas menos as de produtividade policial."""
+    """Naturezas de vitimização: todas menos as de produtividade policial e o
+    FEMINICÍDIO da CTMHF, que já está no HOMICÍDIO."""
     gdf_ra: gpd.GeoDataFrame
     delegacias: gpd.GeoDataFrame
     centroides: dict[str, dict]
@@ -268,6 +310,8 @@ def carregar_ssp() -> BaseSSP:
     ssp = pl.read_parquet(SSP_RA_GEO_PARQUET).filter(
         (pl.col("ra_numero") != 0) & (pl.col("contagem") == "OCORRÊNCIA")
     )
+    ssp = ssp.with_columns(pl.col("natureza").replace(
+        {n: _nome_ssp(n) for n in ssp["natureza"].unique().to_list()}))
     # Último mês com algum valor em cada ano: os seguintes ainda não fecharam.
     ultimo_mes = {
         ano: max(i + 1 for i, m in enumerate(MESES) if g[m].is_not_null().any())
@@ -289,7 +333,11 @@ def carregar_ssp() -> BaseSSP:
         .with_columns(pl.col("n_delegacias").fill_null(0))
         .sort("ra")
     )
-    pop = ssp.select("cd_subdist", "ano", "populacao").unique(["cd_subdist", "ano"])
+    # RA/ano com balanço: só as linhas dos balanços contam. O feminicídio da
+    # CTMHF vem para todas as RAs, inclusive as sem balanço válido no ano
+    # (Sudoeste/Octogonal 2023), que seguem fora do total e da taxa.
+    pop = (ssp.filter(pl.col("fonte") != "ctmhf")
+           .select("cd_subdist", "ano", "populacao").unique(["cd_subdist", "ano"]))
     criacao = {filha: ano for filha, (_, ano) in RAS_DESMEMBRADAS.items()}
     ausentes = (
         ras.select("cd_subdist")
@@ -310,12 +358,14 @@ def carregar_ssp() -> BaseSSP:
             "eixo": eixo,
             "naturezas": sorted(nats),
             "fora_taxa": eixo.startswith(EIXO_FORA_DA_TAXA),
+            "ja_em_homicidio": eixo.startswith(EIXO_JA_EM_HOMICIDIO),
         }
         for eixo, nats in sorted(
             ssp.group_by("eixo").agg(pl.col("natureza").unique()).rows()
         )
     ]
-    padrao = [n for g in grupos if not g["fora_taxa"] for n in g["naturezas"]]
+    padrao = [n for g in grupos if not (g["fora_taxa"] or g["ja_em_homicidio"])
+              for n in g["naturezas"]]
 
     gdf = carregar_setores()
     gdf_ra = dissolver_por_ra(gdf)
@@ -340,17 +390,17 @@ def carregar_ssp() -> BaseSSP:
     )
 
 
-def ssp_por_ra_ano(ssp: BaseSSP, naturezas: list[str], mes_ini: int, mes_fim: int) -> pl.DataFrame:
-    """Ocorrências das `naturezas` nos meses `mes_ini`..`mes_fim` de cada ano, por
-    RA e ano: `cd_subdist`, `ano`, `total`, `populacao`. Só as RAs/anos com
-    balanço. `total` é nulo quando o período não é o ano inteiro e o balanço da
-    RA não detalha esses meses."""
-    ano_inteiro = (mes_ini, mes_fim) == (1, 12)
+def ssp_por_ra_ano(ssp: BaseSSP, naturezas: list[str], meses_sel: list[int]) -> pl.DataFrame:
+    """Ocorrências das `naturezas` nos meses `meses_sel` de cada ano, por RA e
+    ano: `cd_subdist`, `ano`, `total`, `populacao`. Só as RAs/anos com balanço.
+    `total` é nulo quando o período não é o ano inteiro e o balanço da RA não
+    detalha esses meses."""
+    ano_inteiro = sorted(meses_sel) == list(range(1, 13))
     if ano_inteiro:
         soma = ssp.anual.filter(pl.col("natureza").is_in(naturezas))
         sem_detalhe = None
     else:
-        meses = ssp.mensal.filter(pl.col("mes").is_between(mes_ini, mes_fim))
+        meses = ssp.mensal.filter(pl.col("mes").is_in(meses_sel))
         soma = meses.filter(pl.col("natureza").is_in(naturezas)).rename({"valor": "total"})
         sem_detalhe = (meses.filter(pl.col("valor").is_null())
                        .select("cd_subdist", "ano").unique()

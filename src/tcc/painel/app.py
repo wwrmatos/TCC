@@ -2,12 +2,14 @@
 
 - **Brasil — MJ/Sinesp**: BancoVDE 2016–2026 por UF e, quando o evento é
   detalhado por município, pelos municípios da UF escolhida (malhas do IBGE).
-  Série mensal e anual de todo o período, mapa de calor local × ano, e mapa,
-  ranking e tabela do intervalo de anos escolhido;
+  Série mensal (com previsão SARIMA dos 12 meses seguintes) e anual de todo o
+  período, mapa de calor local × ano, e mapa, ranking e tabela do intervalo de
+  anos escolhido;
 - **Distrito Federal — SSP-DF**: balanços 2015–2026 por Região Administrativa,
   com os mapas folium de `tcc.mapas` (coroplético e bolhas) abertos já com a
-  seleção dos filtros do painel, série mensal e anual de todo o período, mapa
-  de calor RA × ano, e ranking e tabela do intervalo de anos escolhido.
+  seleção dos filtros do painel, série mensal (com previsão) e anual de todo o
+  período, mapa de calor RA × ano, e ranking e tabela do intervalo de anos
+  escolhido.
 """
 
 import dataclasses
@@ -15,12 +17,14 @@ from pathlib import Path
 
 import plotly.graph_objects as go
 import polars as pl
-from dash import ALL, Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
+from dash import ALL, Dash, Input, Output, Patch, State, ctx, dash_table, dcc, html, no_update
 
 from tcc.malhas import malha_municipios, malha_uf
 from tcc.mapas import mapa_bolhas, mapa_coropletico, preparar_dados
 from tcc.painel.dados import (
     BASE_TAXA_MJ,
+    HOMICIDIO_SSP,
+    NOMES_SSP,
     MESES,
     BaseMJ,
     BaseSSP,
@@ -29,9 +33,41 @@ from tcc.painel.dados import (
     ssp_por_ra_ano,
 )
 from tcc.populacao import BASE_TAXA, RAS_DESMEMBRADAS
+from tcc.previsao import HORIZONTE, MEDIA_MIN, MESES_MIN, ZEROS_MAX, motivo_sem_previsao, prever
 
 BRASIL = "BR"
+UF_DF = "DF"
 EVENTO_PADRAO = "Homicídio doloso"
+
+# Por que o MJ e a aba Distrito Federal (SSP-DF) dão números diferentes no DF
+# para eventos de mesmo nome. Feminicídio, latrocínio, lesão corporal seguida de
+# morte e roubo de veículo batem e não estão aqui.
+DIFERENCA_DF_MJ: dict[str, str] = {
+    "Homicídio doloso": (
+        "O MJ conta vítimas, sem o feminicídio (desde 2023, é o mesmo número de vítimas "
+        "do balanço do DF). A aba Distrito Federal conta ocorrências e inclui o feminicídio, que os "
+        "balanços das RAs não separam: lá o número é maior."),
+    "Tentativa de homicídio": (
+        "O MJ conta vítimas, sem a tentativa de feminicídio. A aba Distrito Federal conta "
+        "ocorrências e inclui a tentativa de feminicídio: lá o número é maior."),
+    "Estupro": (
+        "Até 2024, o estupro dos balanços das RAs inclui o estupro de vulnerável. Para "
+        "comparar com a aba Distrito Federal nesses anos, use “Estupro (total)”."),
+    "Estupro de vulnerável": (
+        "Na aba Distrito Federal, o estupro de vulnerável só aparece separado a partir de "
+        "2025; antes está dentro do estupro. Para comparar, use “Estupro (total)”."),
+    "Estupro (total)": (
+        "Comparável a estupro + estupro de vulnerável da aba Distrito Federal, mas só bate "
+        "(até 5% de diferença) em 2016, 2019, 2022, 2023 e 2026. Em 2018, 2020, 2021 e "
+        "2024 o MJ tem 14% a 24% a mais, e em 2025, 12% a menos, sem causa identificada; "
+        "2024 e 2025 somados quase coincidem, o que sugere casos datados em anos "
+        "diferentes nas duas fontes."),
+    "Tráfico de drogas": (
+        "A aba Distrito Federal não tem os registros da Polícia Federal; por isso, no DF, "
+        "o filtro de abrangência abre só com a Estadual. Assim, os dois batem exatamente "
+        "de 2016 a 2021 e com até 2% de diferença depois, menos em 2025: o MJ tem 5% a "
+        "mais, sem causa identificada."),
+}
 
 # Na taxa por município, cidades muito pequenas dominam o ranking com uma ou
 # duas ocorrências. O ranking (só ele — mapa e tabela mostram todas) ignora as
@@ -137,14 +173,115 @@ def _vazio(altura: int, msg: str) -> go.Figure:
     return _estilo(fig, altura)
 
 
-def _faixas(anos: list[int]) -> str:
-    """[2015, 2016, 2017, 2023] → "2015–2017 e 2023"."""
-    faixas, ini = [], anos[0]
-    for a, prox in zip(anos, [*anos[1:], None]):
-        if prox != a + 1:
-            faixas.append(str(a) if a == ini else f"{ini}–{a}")
+def _sequencias(valores: list[int]) -> list[tuple[int, int]]:
+    """[2015, 2016, 2017, 2023] → [(2015, 2017), (2023, 2023)]."""
+    seqs, ini = [], valores[0]
+    for v, prox in zip(valores, [*valores[1:], None]):
+        if prox != v + 1:
+            seqs.append((ini, v))
             ini = prox
+    return seqs
+
+
+def _faixas(valores: list[int], rotulo=str) -> str:
+    """[2015, 2016, 2017, 2023] → "2015–2017 e 2023"; `rotulo` escreve cada valor
+    (ex.: o nome do mês)."""
+    faixas = [rotulo(a) if a == b else f"{rotulo(a)}–{rotulo(b)}" for a, b in _sequencias(valores)]
     return faixas[0] if len(faixas) == 1 else ", ".join(faixas[:-1]) + " e " + faixas[-1]
+
+
+TODOS_MESES = list(range(1, 13))
+
+
+def _seletor(id_: str, opcoes: list[dict], valor: list[int], atalhos: list[tuple[str, str]]):
+    """Botões que ligam e desligam cada valor (anos ou meses), em qualquer
+    combinação, e os atalhos `(sufixo do id, rótulo)` abaixo deles."""
+    return html.Div([
+        dcc.Checklist(opcoes, valor, id=id_, inline=True, className="chips"),
+        html.Div([html.Button(r, id=f"{id_}-{suf}", className="botao") for suf, r in atalhos],
+                 className="botoes"),
+    ])
+
+
+def _seletor_anos(id_: str, anos: list[int], ultimo_mes: dict[int, int], padrao: int):
+    # Ano incompleto (o corrente) leva asterisco.
+    opcoes = [{"label": str(a) + ("" if ultimo_mes[a] == 12 else "*"), "value": a} for a in anos]
+    return _seletor(id_, opcoes, [padrao],
+                    [("todos", "Todos"), ("ultimo", "Último completo"), ("limpar", "Limpar")])
+
+
+def _seletor_meses(id_: str):
+    opcoes = [{"label": MARCAS_MESES[m], "value": m} for m in TODOS_MESES]
+    return _seletor(id_, opcoes, TODOS_MESES, [("todos", "Ano todo"), ("limpar", "Limpar")])
+
+
+def _registrar_seletores(app: Dash, prefixo: str, anos: list[int], ultimo_mes: dict[int, int]):
+    """Atalhos dos seletores de anos e meses, e o clique num ano da série, das
+    barras anuais ou do mapa de calor, que seleciona só aquele ano."""
+    completo = max(a for a in anos if ultimo_mes[a] == 12)
+
+    @app.callback(
+        Output(f"{prefixo}-anos", "value"),
+        Input(f"{prefixo}-anos-todos", "n_clicks"),
+        Input(f"{prefixo}-anos-ultimo", "n_clicks"),
+        Input(f"{prefixo}-anos-limpar", "n_clicks"),
+        Input(f"{prefixo}-serie", "clickData"),
+        Input(f"{prefixo}-anual", "clickData"),
+        Input(f"{prefixo}-calor", "clickData"),
+        prevent_initial_call=True,
+    )
+    def _anos(*_):
+        disparo = ctx.triggered_id
+        if disparo == f"{prefixo}-anos-todos":
+            return anos
+        if disparo == f"{prefixo}-anos-ultimo":
+            return [completo]
+        if disparo == f"{prefixo}-anos-limpar":
+            return []
+        click = ctx.triggered[0]["value"]
+        if not click:
+            return no_update
+        ano = int(str(click["points"][0]["x"])[:4])
+        return [ano] if ano in ultimo_mes else no_update
+
+    @app.callback(
+        Output(f"{prefixo}-periodo", "value"),
+        Input(f"{prefixo}-periodo-todos", "n_clicks"),
+        Input(f"{prefixo}-periodo-limpar", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _meses(*_):
+        return TODOS_MESES if ctx.triggered_id == f"{prefixo}-periodo-todos" else []
+
+
+def _selecao(anos_sel: list[int] | None, meses_sel: list[int] | None, ultimo_mes: dict[int, int]):
+    """Anos e meses escolhidos, em ordem, e o que deriva deles: o último ano
+    (`a1`), o ano de referência da variação (o anterior ao último, com um ano
+    só; o primeiro, com vários), os meses do último ano que já têm dados
+    (`meses_a1`, que a variação usa nos dois anos) e se não há nenhum
+    (`sem_meses`). Sem nenhum ano ou mês escolhido, `None`."""
+    anos_per, meses = sorted(anos_sel or []), sorted(meses_sel or [])
+    if not anos_per or not meses:
+        return None
+    a1 = anos_per[-1]
+    unico = len(anos_per) == 1
+    ref = a1 - 1 if unico else anos_per[0]
+    meses_a1 = [m for m in meses if m <= ultimo_mes[a1]]
+    return anos_per, meses, a1, unico, ref, meses_a1 or meses, not meses_a1
+
+
+def _faixas_serie(anos_per: list[int], meses: list[int], ultimo_mes: dict[int, int]):
+    """Trechos da série mensal a destacar: os meses escolhidos de cada ano
+    escolhido, com os meses seguidos (inclusive de dezembro para janeiro)
+    num trecho só."""
+    def data(i):  # índice do mês desde o ano 0 → primeiro dia do mês
+        return f"{i // 12}-{i % 12 + 1:02d}-01"
+
+    indices = [a * 12 + m - 1 for a in anos_per for m in meses if m <= ultimo_mes[a]]
+    return [(data(i), data(j + 1)) for i, j in _sequencias(indices)] if indices else []
+
+
+SEM_SELECAO = "Nenhum ano ou mês marcado: escolha ao menos um de cada no filtro acima."
 
 
 def _caixa_avisos(avisos: list[tuple[str, str]], bloqueio: str | None = None) -> list:
@@ -193,17 +330,31 @@ MEDIA_MIN_SEM_ENVIO = 12
 TOP_CALOR_MUNICIPIOS = 20
 
 
-def _anos_txt(a0: int, a1: int) -> str:
-    return str(a0) if a0 == a1 else f"{a0}–{a1}"
+def _anos_txt(anos: list[int]) -> str:
+    return _faixas(anos)
 
 
-def _periodo_txt(a0: int, a1: int, ini: int, fim: int) -> str:
-    """Anos `a0`..`a1`, só os meses `ini`..`fim` de cada um."""
-    anos = _anos_txt(a0, a1)
-    if (ini, fim) == (1, 12):
-        return anos
-    meses = MARCAS_MESES[ini] if ini == fim else f"{MARCAS_MESES[ini]}–{MARCAS_MESES[fim]}"
-    return f"{meses} de {anos}" if a0 == a1 else f"{meses} de cada ano, {anos}"
+def _meses_txt(meses: list[int]) -> str:
+    """[1, 2, 3, 12] → "Jan–Mar e Dez"."""
+    return _faixas(meses, MARCAS_MESES.get)
+
+
+def _meses_extenso(meses: list[int]) -> str:
+    return _faixas(meses, lambda m: MESES_EXTENSO[m - 1])
+
+
+def _periodo_txt(anos: list[int], meses: list[int]) -> str:
+    """Os anos escolhidos, só os `meses` de cada um."""
+    anos_txt = _anos_txt(anos)
+    if meses == TODOS_MESES:
+        return anos_txt
+    m = _meses_txt(meses)
+    return f"{m} de {anos_txt}" if len(anos) == 1 else f"{m} de cada ano, {anos_txt}"
+
+
+def _recorte_txt(meses: list[int]) -> str:
+    """Meses da comparação anual: "ano inteiro" ou "só Fev e Dez"."""
+    return "ano inteiro" if meses == TODOS_MESES else f"só {_meses_txt(meses)}"
 
 
 def _variacao(atual: float | None, anterior: float | None) -> float | None:
@@ -232,7 +383,7 @@ def _ufs_sem_envio(f: pl.DataFrame, ufs: pl.DataFrame, anos: list[int]) -> pl.Da
 
 
 def _serie_historica(datas: list[str], valores: list, media: list, hover: list[str],
-                     faixa: tuple[str, str], altura: int) -> go.Figure:
+                     faixas: list[tuple[str, str]], altura: int) -> go.Figure:
     fig = go.Figure([
         go.Scatter(
             x=datas, y=valores, name="Mês", mode="lines", connectgaps=False,
@@ -244,12 +395,91 @@ def _serie_historica(datas: list[str], valores: list, media: list, hover: list[s
             line=dict(color=AZUL, width=2.5), hoverinfo="skip",
         ),
     ])
-    fig.add_vrect(x0=faixa[0], x1=faixa[1], fillcolor=AZUL, opacity=0.08, line_width=0)
+    for x0, x1 in faixas:
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=AZUL, opacity=0.08, line_width=0)
     _estilo(fig, altura, hovermode="x", showlegend=True,
-            legend=dict(orientation="h", x=0, y=1.08, font=dict(size=12)))
+            legend=dict(orientation="h", x=0, y=1.08, font=dict(size=12), traceorder="normal"))
     fig.update_xaxes(dtick="M12", tickformat="%Y", hoverformat="%b/%Y")
     fig.update_yaxes(rangemode="tozero")
     return fig
+
+
+def _cartao_serie(titulo: str, prefixo: str) -> html.Section:
+    """Cartão da série mensal. A previsão chega depois, pelo callback de
+    :func:`_registrar_previsao`, a partir da série guardada em `<prefixo>-serie-modelo`."""
+    return cartao(titulo, "", grafico(f"{prefixo}-serie", 320),
+                  html.Div(id=f"{prefixo}-previsao-nota", className="subtitulo"),
+                  dcc.Store(id=f"{prefixo}-serie-modelo"),
+                  id_subtitulo=f"{prefixo}-serie-sub")
+
+
+def _registrar_previsao(app: Dash, prefixo: str) -> None:
+    """Acrescenta ao gráfico `<prefixo>-serie` a previsão SARIMA dos
+    :data:`HORIZONTE` meses seguintes. Fica num callback à parte porque o
+    ajuste leva alguns segundos e não deve segurar o resto da página."""
+
+    @app.callback(
+        Output(f"{prefixo}-serie", "figure", allow_duplicate=True),
+        Output(f"{prefixo}-previsao-nota", "children"),
+        Input(f"{prefixo}-serie-modelo", "data"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def _prever(dados):
+        if not dados:
+            return no_update, ""
+        datas, valores = dados["datas"], dados["valores"]
+        unidade, casas = dados["unidade"], dados["casas"]
+        # O callback da aba pode trazer um motivo que a série sozinha não mostra.
+        motivo = dados.get("motivo") or motivo_sem_previsao(valores)
+        obs = dados.get("obs", "")
+        if motivo:
+            return no_update, html.Div([
+                html.Strong(f"Sem previsão para este filtro: {motivo}."),
+                f" A previsão só é feita para séries com pelo menos {MESES_MIN} meses com "
+                f"dado, dado no último mês, média de {fmt(MEDIA_MIN)} ou mais por mês e no "
+                f"máximo {fmt(100 * ZEROS_MAX)}% de meses zerados. Abaixo disso, o modelo "
+                "passa a prever ruído.",
+            ], className="aviso aviso--previsao")
+        prev = prever(valores)
+
+        a, m = int(datas[-1][:4]), int(datas[-1][5:7])
+        futuras = []
+        for _ in range(HORIZONTE):
+            a, m = (a + 1, 1) if m == 12 else (a, m + 1)
+            futuras.append(f"{a}-{m:02d}-01")
+        hover = [f"<b>{MARCAS_MESES[int(d[5:7])]}/{d[:4]}</b><br>previsão: {fmt(v, casas)} "
+                 f"{unidade}<br>intervalo de 95%: {fmt(lo, casas)}–{fmt(hi, casas)}"
+                 for d, v, lo, hi in zip(futuras, prev.media, prev.inferior, prev.superior)]
+        # A faixa e o trecho pontilhado partem do último mês observado, para a
+        # previsão não ficar solta da série.
+        x = [datas[-1], *futuras]
+        y0 = valores[-1]
+        fig = Patch()
+        fig["data"].extend([
+            go.Scatter(x=x, y=[y0, *prev.superior], mode="lines", line=dict(width=0),
+                       hoverinfo="skip", showlegend=False),
+            go.Scatter(x=x, y=[y0, *prev.inferior], mode="lines", line=dict(width=0),
+                       fill="tonexty", fillcolor="rgba(235,104,52,0.15)",
+                       name="Intervalo de 95%", hoverinfo="skip"),
+            go.Scatter(x=x[:2], y=[y0, prev.media[0]], mode="lines",
+                       line=dict(color=LARANJA, width=2, dash="dot"),
+                       hoverinfo="skip", showlegend=False),
+            go.Scatter(x=futuras, y=prev.media, mode="lines", name="Previsão (SARIMA)",
+                       line=dict(color=LARANJA, width=2, dash="dot"),
+                       customdata=hover, hovertemplate="%{customdata}<extra></extra>"),
+        ])
+
+        nota = (f"Previsão dos próximos {HORIZONTE} meses: {prev.descricao} sobre o log da "
+                "contagem mensal, com as ordens escolhidas pelo AIC para este filtro; a faixa "
+                "é o intervalo de 95%.")
+        if prev.erro is not None:
+            nota += (f" Ajustado sem os últimos {HORIZONTE} meses, o modelo errou neles em "
+                     f"média {fmt(prev.erro, casas)} {unidade} por mês; repetir o mesmo mês "
+                     f"do ano anterior errou {fmt(prev.erro_ingenuo, casas)}")
+            nota += ("." if prev.supera_ingenuo else
+                     ". Neste filtro o modelo não supera essa regra simples: leia a previsão "
+                     "com cautela.")
+        return fig, f"{nota} {obs}".strip()
 
 
 def _layout_mj(mj: BaseMJ) -> html.Div:
@@ -259,15 +489,15 @@ def _layout_mj(mj: BaseMJ) -> html.Div:
         opcoes_evento.append({"label": html.Span(cat.upper(), className="opcao-categoria"),
                               "value": f"__{cat}", "disabled": True, "search": ""})
         for ev in eventos:
-            texto = f"{ev} ({mj.unidade[ev]})" + ("" if ev in mj.municipal else " · só por UF")
+            # A unidade fica no rótulo só quando não é óbvia pelo nome (kg).
+            texto = (ev + (" (kg)" if mj.unidade[ev] == "kg" else "")
+                     + ("" if ev in mj.municipal else " · só por UF"))
             opcoes_evento.append({"label": texto, "value": ev,
                                   "search": " ".join([ev, cat, *mj.grupos.get(ev, [])])})
     opcoes_uf = [{"label": "Brasil (todas as UFs)", "value": BRASIL}] + [
         {"label": f"{r['nome_uf']} ({r['sigla_uf']})", "value": r["sigla_uf"]}
         for r in mj.ufs.to_dicts()
     ]
-    # Ano incompleto (o corrente) leva asterisco na marca.
-    marcas_ano = {a: str(a) + ("" if mj.ultimo_mes[a] == 12 else "*") for a in mj.anos}
     ano_padrao = max(a for a in mj.anos if mj.ultimo_mes[a] == 12)
     primeiro, ultimo = mj.anos[0], mj.anos[-1]
     return html.Div([
@@ -276,11 +506,9 @@ def _layout_mj(mj: BaseMJ) -> html.Div:
                                           clearable=False), largo=True),
             filtro("Localidade", dcc.Dropdown(opcoes_uf, BRASIL, id="mj-uf", clearable=False)),
             filtro("Abrangência", dcc.Checklist(id="mj-abrangencia", className="checklist")),
-            filtro("Anos", dcc.RangeSlider(primeiro, ultimo, 1, value=[ano_padrao, ano_padrao],
-                                           id="mj-anos", marks=marcas_ano,
-                                           allow_direct_input=False), largo=True),
-            filtro("Meses", dcc.RangeSlider(1, 12, 1, value=[1, 12], id="mj-periodo",
-                                            marks=MARCAS_MESES, allow_direct_input=False), largo=True),
+            filtro("Anos", _seletor_anos("mj-anos", mj.anos, mj.ultimo_mes, ano_padrao),
+                   largo=True),
+            filtro("Meses (valem em cada ano)", _seletor_meses("mj-periodo"), largo=True),
             filtro("Colorir e ordenar por", dcc.RadioItems(
                 [{"label": f"Taxa por {fmt(BASE_TAXA_MJ)} hab.", "value": "taxa"},
                  {"label": "Total absoluto", "value": "valor"}],
@@ -294,8 +522,7 @@ def _layout_mj(mj: BaseMJ) -> html.Div:
             cartao("", "", grafico("mj-ranking", 560), id_titulo="mj-ranking-titulo",
                    id_subtitulo="mj-ranking-sub"),
         ], className="grade grade--mapa"),
-        cartao(f"Evolução mensal, {primeiro}–{ultimo}", "", grafico("mj-serie", 320),
-               id_subtitulo="mj-serie-sub"),
+        _cartao_serie(f"Evolução mensal, {primeiro}–{ultimo}", "mj"),
         html.Div([
             cartao("", "", grafico("mj-anual", 320), id_titulo="mj-anual-titulo",
                    id_subtitulo="mj-anual-sub"),
@@ -336,9 +563,13 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         Output("mj-abrangencia", "options"),
         Output("mj-abrangencia", "value"),
         Input("mj-evento", "value"),
+        Input("mj-uf", "value"),
     )
-    def _abrangencias(evento):
+    def _abrangencias(evento, uf):
         abr = sorted(por_evento[evento]["abrangencia"].unique().to_list())
+        # No DF, só a Estadual: é o que a aba Distrito Federal (SSP-DF) conta.
+        if uf == UF_DF and "Estadual" in abr:
+            return abr, ["Estadual"]
         return abr, abr
 
     # Clicar numa UF do mapa nacional abre os municípios dela.
@@ -353,27 +584,14 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
             return no_update
         return click["points"][0]["customdata"][0]
 
-    # Clicar num ano da série, das barras anuais ou do mapa de calor seleciona só
-    # aquele ano.
-    @app.callback(
-        Output("mj-anos", "value"),
-        Input("mj-serie", "clickData"),
-        Input("mj-anual", "clickData"),
-        Input("mj-calor", "clickData"),
-        prevent_initial_call=True,
-    )
-    def _clique_ano(*cliques):
-        click = ctx.triggered[0]["value"]
-        if not click:
-            return no_update
-        ano = int(str(click["points"][0]["x"])[:4])
-        return [ano, ano] if ano in mj.ultimo_mes else no_update
+    _registrar_seletores(app, "mj", anos, mj.ultimo_mes)
 
     @app.callback(
         Output("mj-aviso", "children"),
         Output("mj-kpis", "children"),
         Output("mj-serie", "figure"),
         Output("mj-serie-sub", "children"),
+        Output("mj-serie-modelo", "data"),
         Output("mj-anual", "figure"),
         Output("mj-anual-titulo", "children"),
         Output("mj-anual-sub", "children"),
@@ -398,24 +616,21 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         Input("mj-metrica", "value"),
     )
     def _atualizar(evento, abrangencias, uf, anos_sel, periodo, metrica):
+        selecao = _selecao(anos_sel, periodo, mj.ultimo_mes)
+        if selecao is None:
+            return (_caixa_avisos([], SEM_SELECAO), *[no_update] * 20)
+        # A variação compara o último ano escolhido com o anterior a ele (um ano
+        # só) ou com o primeiro (vários anos). No ano corrente, os meses ainda
+        # sem dados saem do período e da comparação, que usa os mesmos meses
+        # (`meses_a1`) nos dois anos.
+        anos_per, meses, a1, unico, ref, meses_a1, sem_meses = selecao
         unidade = mj.unidade[evento]
         casas = _casas(unidade)
-        ini, fim = periodo
-        a0, a1 = anos_sel
-        unico = a0 == a1
-        anos_per = list(range(a0, a1 + 1))
-        # A variação compara o último ano do período com o anterior a ele (um
-        # ano só) ou com o primeiro (vários anos).
-        ref = a1 - 1 if unico else a0
-        # No ano corrente, os meses ainda sem dados saem do período e da
-        # comparação, que usa os mesmos meses nos dois anos.
-        sem_meses = ini > mj.ultimo_mes[a1]
-        fim_ano = fim if sem_meses else min(fim, mj.ultimo_mes[a1])
         brasil = uf == BRASIL
         municipal = evento in mj.municipal and not brasil
         nome_escopo = "Brasil" if brasil else uf_por_sigla[uf]["nome_uf"]
-        anos_txt = _anos_txt(a0, a1)
-        periodo_txt = _periodo_txt(a0, a1, ini, fim_ano if unico else fim)
+        anos_txt = _anos_txt(anos_per)
+        periodo_txt = _periodo_txt(anos_per, meses_a1 if unico else meses)
         # Os gráficos ano a ano mostram a taxa de cada ano; os do período, a média
         # anual quando há mais de um ano.
         rotulo_taxa_ano = f"{unidade} por {fmt(BASE_TAXA_MJ)} hab."
@@ -432,8 +647,8 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
                       else mj.pop_uf.filter(pl.col("sigla_uf") == uf).drop("sigla_uf"))
         pop_ano = dict(pop_escopo.rows())
 
-        def no_periodo(df, anos_, m_fim=fim):
-            return df.filter(pl.col("ano").is_in(anos_) & pl.col("mes").is_between(ini, m_fim))
+        def no_periodo(df, anos_, meses_=meses):
+            return df.filter(pl.col("ano").is_in(anos_) & pl.col("mes").is_in(meses_))
 
         # Anos sem envio ficam fora do total e da população da taxa: a taxa de
         # vários anos é a média anual dos anos com dado.
@@ -442,9 +657,9 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         total = sel["valor"].sum()
         pop_validos = sum(pop_ano[a] for a in anos_validos)
         taxa = total * BASE_TAXA_MJ / pop_validos if pop_validos else None
-        total_alvo = no_periodo(escopo, [a1], fim_ano)["valor"].sum()
+        total_alvo = no_periodo(escopo, [a1], meses_a1)["valor"].sum()
         tem_ref = ref in mj.ultimo_mes and ref not in anos_lacuna
-        total_ref = no_periodo(escopo, [ref], fim_ano)["valor"].sum() if tem_ref else None
+        total_ref = no_periodo(escopo, [ref], meses_a1)["valor"].sum() if tem_ref else None
         lacuna = not anos_validos or (unico and sem_meses)
 
         # --- avisos ----------------------------------------------------------
@@ -454,10 +669,10 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         if sem_meses:
             avisos.append((
                 f"{a1} só tem dados até {mes_fim_txt}.",
-                f"Escolha meses até {mes_fim_txt} para ver esse ano.",
+                f"Escolha algum mês até {mes_fim_txt} para ver esse ano.",
             ))
-        elif fim > fim_ano:
-            meses_cmp = f"{MESES_EXTENSO[ini - 1]} a {mes_fim_txt}"
+        elif meses_a1 != meses:
+            meses_cmp = _meses_extenso(meses_a1)
             avisos.append((
                 f"{a1} ainda está em andamento: há dados só até {mes_fim_txt}.",
                 f"Por isso, a variação compara {meses_cmp} de {ref} com {meses_cmp} "
@@ -549,6 +764,8 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
                 "Apreensões de droga são medidas em kg.",
                 f"A “taxa” aqui é kg apreendidos por {fmt(BASE_TAXA_MJ)} habitantes.",
             ))
+        if uf == UF_DF and evento in DIFERENCA_DF_MJ:
+            avisos.append(("Diferente da aba Distrito Federal.", DIFERENCA_DF_MJ[evento]))
         aviso = _caixa_avisos(avisos, None if abrangencias else
                               "Nenhuma abrangência marcada: escolha ao menos uma no filtro acima.")
 
@@ -576,13 +793,13 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
 
         fonte_local = escopo if municipal else f
 
-        def por_local_em(anos_, m_fim=fim):
+        def por_local_em(anos_, meses_=meses):
             """Soma dos anos `anos_` por local. O ano em que a UF não enviou fica
             de fora do valor e da população; sem nenhum ano válido, fica nulo."""
             if not anos_:
                 return None
             anual = pl.concat([
-                por_local_no(a, no_periodo(fonte_local, [a], m_fim))
+                por_local_no(a, no_periodo(fonte_local, [a], meses_))
                 .with_columns(pl.lit(a).alias("ano")) for a in anos_
             ]).join(sem_envio.with_columns(pl.lit(True).alias("lac")),
                     on=["sigla_uf", "ano"], how="left")
@@ -607,7 +824,7 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         if not unico:
             comparar["atual"] = [a1]
         for nome, anos_c in comparar.items():
-            outro = por_local_em(anos_c, fim_ano)
+            outro = por_local_em(anos_c, meses_a1)
             por_local = (por_local.join(outro.select("codigo", pl.col("valor").alias(nome)),
                                         on="codigo", how="left")
                          if outro is not None else por_local.with_columns(pl.lit(None, pl.Float64).alias(nome)))
@@ -629,11 +846,11 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         fonte_pop = mj.fonte_populacao[a1]
         alvo_lacuna = a1 in anos_lacuna or sem_meses
         if unico:
-            nota_var = (f"{fmt(total_ref, casas)} {unidade} em {_periodo_txt(ref, ref, ini, fim_ano)}"
+            nota_var = (f"{fmt(total_ref, casas)} {unidade} em {_periodo_txt([ref], meses_a1)}"
                         if total_ref is not None else "Sem ano anterior comparável")
         else:
-            nota_var = (f"{_periodo_txt(ref, ref, ini, fim_ano)}: {fmt(total_ref, casas)} → "
-                        f"{_periodo_txt(a1, a1, ini, fim_ano)}: {fmt(total_alvo, casas)}"
+            nota_var = (f"{_periodo_txt([ref], meses_a1)}: {fmt(total_ref, casas)} → "
+                        f"{_periodo_txt([a1], meses_a1)}: {fmt(total_alvo, casas)}"
                         if total_ref is not None and not alvo_lacuna
                         else f"Sem dado comparável em {ref} ou {a1}")
         kpis = [
@@ -684,17 +901,20 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
             + ("" if md is None else f"<br>média de 12 meses: {fmt(md, casas)}")
             for a, m, v, md in mensal.select("ano", "mes", "valor", "media").rows()
         ]
-        faixa = (f"{a0}-{ini:02d}-01", f"{a1}-{fim_ano:02d}-28")
         serie = _serie_historica(datas, mensal["valor"].to_list(), mensal["media"].to_list(),
-                                 hover_m, faixa, 320)
+                                 hover_m, _faixas_serie(anos_per, meses, mj.ultimo_mes), 320)
         serie_sub = (f"{evento} em {nome_escopo}: {unidade} por mês e média dos 12 meses "
                      f"anteriores. A faixa marca {anos_txt}; clique num mês para ver só aquele "
                      "ano.")
+        # No MJ, mês sem registro é zero de fato; os anos em que a UF não
+        # enviou dados já vêm como faltantes.
+        serie_modelo = {"datas": datas, "valores": mensal["valor"].to_list(),
+                        "unidade": unidade, "casas": casas}
 
         # --- comparação anual (mesmos meses em todos os anos) ----------------
         anual = (
             pl.DataFrame({"ano": anos})
-            .join(escopo.filter(pl.col("mes").is_between(ini, fim))
+            .join(escopo.filter(pl.col("mes").is_in(meses))
                   .group_by("ano").agg(pl.col("valor").sum()), on="ano", how="left")
             .join(pop_escopo, on="ano", how="left")
             .with_columns(
@@ -703,7 +923,7 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
             .with_columns((pl.col("valor") * BASE_TAXA_MJ / pl.col("populacao")).alias("taxa"))
             .sort("ano")
         )
-        parcial = {a for a in anos if mj.ultimo_mes[a] < fim}
+        parcial = {a for a in anos if mj.ultimo_mes[a] < meses[-1]}
         n_sem_envio = dict(sem_envio.group_by("ano").len().rows()) if brasil else {}
         linhas = anual.to_dicts()
         hover_a = []
@@ -725,7 +945,7 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         anual_fig = go.Figure(go.Bar(
             x=[str(a) for a in anual["ano"]], y=anual[metrica].to_list(),
             marker=dict(
-                color=[AZUL if a0 <= a <= a1 else AZUL_CLARO for a in anual["ano"]],
+                color=[AZUL if a in anos_per else AZUL_CLARO for a in anual["ano"]],
                 pattern=dict(shape=["/" if a in parcial else "" for a in anual["ano"]],
                              fgcolor="white", solidity=0.3),
                 cornerradius=4,
@@ -735,9 +955,7 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         _estilo(anual_fig, 320, bargap=0.3)
         anual_fig.update_xaxes(type="category")
         anual_titulo = "Comparação anual"
-        meses_txt = ("ano inteiro" if (ini, fim) == (1, 12)
-                     else f"só {MARCAS_MESES[ini]}–{MARCAS_MESES[fim]}" if ini != fim
-                     else f"só {MARCAS_MESES[ini]}")
+        meses_txt = _recorte_txt(meses)
         anual_sub = (f"{rotulo_metrica_ano.capitalize()} em {nome_escopo} ({meses_txt}, em todos "
                      f"os anos). Em destaque, {anos_txt}"
                      + ("; hachurado, ano ainda incompleto" if parcial else "") + ".")
@@ -817,7 +1035,7 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
             ranking_sub += f" Só entram municípios com {fmt(POP_MIN_RANKING)}+ habitantes."
 
         # --- mapa de calor: local × ano --------------------------------------
-        periodo_f = f.filter(pl.col("mes").is_between(ini, fim))
+        periodo_f = f.filter(pl.col("mes").is_in(meses))
         if municipal:
             # Os municípios grandes de maior valor no período.
             escolhidos = (por_local.filter(pl.col("populacao") >= POP_MIN_RANKING)
@@ -932,7 +1150,7 @@ def _registrar_mj(app: Dash, mj: BaseMJ) -> None:
         anual_sub, mapa_sub, ranking_sub, calor_sub = (
             t.replace("..", ".") for t in (anual_sub, mapa_sub, ranking_sub, calor_sub))
         return (
-            aviso, kpis, serie, serie_sub,
+            aviso, kpis, serie, serie_sub, serie_modelo,
             anual_fig, anual_titulo, anual_sub, sexo, sexo_sub,
             mapa, mapa_titulo, mapa_sub, ranking, ranking_titulo, ranking_sub,
             calor_fig, calor_titulo, calor_sub,
@@ -956,7 +1174,6 @@ def _layout_ssp(ssp: BaseSSP) -> html.Div:
         {"label": html.Span(n, title=g["eixo"]), "value": n, "search": n}
         for g in ssp.grupos for n in g["naturezas"]
     ]
-    marcas_ano = {a: str(a) + ("" if ssp.ultimo_mes[a] == 12 else "*") for a in ssp.anos}
     ano_padrao = max(a for a in ssp.anos if ssp.ultimo_mes[a] == 12)
     primeiro, ultimo = ssp.anos[0], ssp.anos[-1]
     return html.Div([
@@ -973,11 +1190,9 @@ def _layout_ssp(ssp: BaseSSP) -> html.Div:
                     html.Button("Limpar", id="ssp-btn-limpar", className="botao"),
                 ], className="botoes"),
             ]), largo=True),
-            filtro("Anos", dcc.RangeSlider(primeiro, ultimo, 1, value=[ano_padrao, ano_padrao],
-                                           id="ssp-anos", marks=marcas_ano,
-                                           allow_direct_input=False), largo=True),
-            filtro("Meses", dcc.RangeSlider(1, 12, 1, value=[1, 12], id="ssp-periodo",
-                                            marks=MARCAS_MESES, allow_direct_input=False), largo=True),
+            filtro("Anos", _seletor_anos("ssp-anos", ssp.anos, ssp.ultimo_mes, ano_padrao),
+                   largo=True),
+            filtro("Meses (valem em cada ano)", _seletor_meses("ssp-periodo"), largo=True),
             filtro("Mapa", dcc.RadioItems(
                 [{"label": "Coroplético (taxa)", "value": "coropletico"},
                  {"label": "Bolhas (total)", "value": "bolhas"}],
@@ -992,8 +1207,7 @@ def _layout_ssp(ssp: BaseSSP) -> html.Div:
             cartao("", "", grafico("ssp-ranking", 640), id_titulo="ssp-ranking-titulo",
                    id_subtitulo="ssp-ranking-sub"),
         ], className="grade grade--mapa"),
-        cartao(f"Evolução mensal no DF, {primeiro}–{ultimo}", "", grafico("ssp-serie", 320),
-               id_subtitulo="ssp-serie-sub"),
+        _cartao_serie(f"Evolução mensal no DF, {primeiro}–{ultimo}", "ssp"),
         cartao("Comparação anual", "", grafico("ssp-anual", 320), id_subtitulo="ssp-anual-sub"),
         cartao("Regiões Administrativas ano a ano", "", grafico("ssp-calor", 820),
                id_subtitulo="ssp-calor-sub"),
@@ -1017,8 +1231,8 @@ def _nome_ra(ra: str) -> str:
 
 
 def _nome_natureza(n: str) -> str:
-    """"ESTUPRO DE VULNERÁVEL" → "Estupro de vulnerável"."""
-    return n.capitalize()
+    """A natureza já vem com o nome do painel (`tcc.painel.dados.NOMES_SSP`)."""
+    return n
 
 
 def _lista_ras(df: pl.DataFrame) -> str:
@@ -1032,6 +1246,7 @@ def _lista_ras(df: pl.DataFrame) -> str:
 def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
     todas = [n for g in ssp.grupos for n in g["naturezas"]]
     fora_taxa = {n for g in ssp.grupos if g["fora_taxa"] for n in g["naturezas"]}
+    ja_em_homicidio = {n for g in ssp.grupos if g["ja_em_homicidio"] for n in g["naturezas"]}
     ordem = {n: i for i, n in enumerate(todas)}
     eixo_de = {n: g["eixo"] for g in ssp.grupos for n in g["naturezas"]}
     anos = ssp.anos
@@ -1053,6 +1268,54 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
             ssp.mensal.filter(pl.col("valor").is_null()).select("cd_subdist", "ano", "mes"),
         ]).unique().group_by("ano", "mes").len().rows()
     }
+    # Meses (ano, mês) com registro de cada natureza.
+    meses_natureza = {
+        n: set(df.select("ano", "mes").rows())
+        for (n,), df in ssp.mensal.partition_by("natureza", as_dict=True).items()
+    }
+    meses_cal = calendario.rows()
+
+    def _inicio(naturezas: list[str]) -> tuple[int, int] | None:
+        """Primeiro (ano, mês) em que alguma das naturezas tem registro. Antes
+        dele, nenhuma existia: é falta de dado, não zero (FEMINICÍDIO por RA só
+        existe a partir de 2025)."""
+        primeiros = [min(meses_natureza[n]) for n in naturezas if meses_natureza.get(n)]
+        return min(primeiros) if primeiros else None
+
+    def _anos_sem(naturezas: list[str]) -> set[int]:
+        """Anos em que nenhuma das naturezas tem registro: ficam sem dado."""
+        return {a for a in anos
+                if not any(a in ssp.anos_natureza.get(n, set()) for n in naturezas)}
+
+    def _serie_para_modelo(naturezas: list[str]) -> tuple[list[int | None], list[str]]:
+        """Série mensal do DF para o modelo e as naturezas deixadas de fora.
+
+        A série tem `None` onde a soma não é comparável: meses em que falta
+        alguma RA e meses, depois do primeiro registro, em que uma natureza
+        escolhida não aparece (o gráfico mostra esses meses como zero, mas são
+        lacunas do balanço, como TRÁFICO DE DROGAS em 2019). Antes do primeiro
+        registro, a natureza ainda não existia e conta como zero, a menos que
+        nenhuma das escolhidas existisse: aí o mês é `None`. Naturezas sem
+        registro no último mês (FURTO A TRANSEUNTE não sai nos balanços de 2026)
+        ficam fora da soma: senão o fim da série seria todo faltante."""
+        fora = [n for n in naturezas if meses_cal[-1] not in meses_natureza.get(n, set())]
+        naturezas = [n for n in naturezas if n not in fora]
+        soma = {
+            (a, m): v for a, m, v in
+            ssp.mensal.filter(pl.col("natureza").is_in(naturezas))
+            .group_by("ano", "mes").agg(pl.col("valor").sum()).rows()
+        }
+        lacunas = set()
+        for n in naturezas:
+            tem = meses_natureza.get(n, set())
+            if tem:
+                inicio = min(tem)
+                lacunas |= {am for am in meses_cal if am >= inicio and am not in tem}
+        inicio = _inicio(naturezas)
+        valores = [None if faltam_mes.get(am) or am in lacunas or inicio is None or am < inicio
+                   else int(soma.get(am) or 0)
+                   for am in meses_cal]
+        return valores, fora
 
     @app.callback(
         Output("ssp-naturezas", "value"),
@@ -1072,21 +1335,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
             return []
         return ssp.grupos[disparo["i"]]["naturezas"]
 
-    # Clicar num ano da série, das barras anuais ou do mapa de calor seleciona só
-    # aquele ano.
-    @app.callback(
-        Output("ssp-anos", "value"),
-        Input("ssp-serie", "clickData"),
-        Input("ssp-anual", "clickData"),
-        Input("ssp-calor", "clickData"),
-        prevent_initial_call=True,
-    )
-    def _clique_ano(*_):
-        click = ctx.triggered[0]["value"]
-        if not click:
-            return no_update
-        ano = int(str(click["points"][0]["x"])[:4])
-        return [ano, ano] if ano in ssp.ultimo_mes else no_update
+    _registrar_seletores(app, "ssp", anos, ssp.ultimo_mes)
 
     def _por_ra(ra_ano: pl.DataFrame, anos_: list[int]) -> pl.DataFrame:
         """Soma dos anos `anos_` por RA, só os anos com dado; a taxa é a média
@@ -1110,14 +1359,18 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
     )
     def _mapa(naturezas, anos_sel, periodo, tipo):
         naturezas = sorted(naturezas or [], key=ordem.get)
-        (a0, a1), (ini, fim) = anos_sel, periodo
+        selecao = _selecao(anos_sel, periodo, ssp.ultimo_mes)
+        if selecao is None:
+            return no_update, SEM_SELECAO
+        anos_per, meses = selecao[:2]
         # RAs/anos que entram: com balanço e com os meses do período.
-        validos = (ssp_por_ra_ano(ssp, [], ini, fim)
-                   .filter(pl.col("ano").is_between(a0, a1) & pl.col("total").is_not_null()))
-        if (ini, fim) == (1, 12):
+        validos = (ssp_por_ra_ano(ssp, [], meses)
+                   .filter(pl.col("ano").is_in(anos_per) & pl.col("total").is_not_null()
+                           & ~pl.col("ano").is_in(list(_anos_sem(naturezas)))))
+        if meses == TODOS_MESES:
             fatos = ssp.anual
         else:
-            fatos = (ssp.mensal.filter(pl.col("mes").is_between(ini, fim))
+            fatos = (ssp.mensal.filter(pl.col("mes").is_in(meses))
                      .group_by("cd_subdist", "ano", "natureza")
                      .agg(pl.col("valor").sum().alias("total")))
         por_nat = (
@@ -1143,8 +1396,8 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
         else:
             mapa = mapa_coropletico(ssp.gdf_ra, ssp.gdf_ra, ssp.delegacias, dados,
                                     painel_aberto=False)
-        sub = (f"Ocorrências das naturezas selecionadas em {_periodo_txt(a0, a1, ini, fim)}"
-               + ("" if a0 == a1 else ", somadas no período; a cor é a taxa média anual")
+        sub = (f"Ocorrências das naturezas selecionadas em {_periodo_txt(anos_per, meses)}"
+               + ("" if len(anos_per) == 1 else ", somadas no período; a cor é a taxa média anual")
                + ". Os marcadores azuis são as delegacias (localização atual). Em cinza, RA "
                "sem dado no período.")
         return mapa.get_root().render(), sub
@@ -1157,6 +1410,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
         Output("ssp-ranking-sub", "children"),
         Output("ssp-serie", "figure"),
         Output("ssp-serie-sub", "children"),
+        Output("ssp-serie-modelo", "data"),
         Output("ssp-anual", "figure"),
         Output("ssp-anual-sub", "children"),
         Output("ssp-calor", "figure"),
@@ -1169,30 +1423,30 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
     )
     def _atualizar(naturezas, anos_sel, periodo):
         naturezas = naturezas or []
-        ini, fim = periodo
-        a0, a1 = anos_sel
-        unico = a0 == a1
-        anos_per = list(range(a0, a1 + 1))
+        selecao = _selecao(anos_sel, periodo, ssp.ultimo_mes)
+        if selecao is None:
+            return (_caixa_avisos([], SEM_SELECAO), *[no_update] * 13)
+        anos_per, meses, a1, unico, ref, meses_a1, sem_meses = selecao
         # A variação compara o último ano com o anterior a ele (um ano só) ou com
         # o primeiro (vários anos), nos mesmos meses.
-        ref = a1 - 1 if unico else a0
-        sem_meses = ini > ssp.ultimo_mes[a1]
-        fim_ano = fim if sem_meses else min(fim, ssp.ultimo_mes[a1])
-        anos_txt = _anos_txt(a0, a1)
-        periodo_txt = _periodo_txt(a0, a1, ini, fim_ano if unico else fim)
+        anos_txt = _anos_txt(anos_per)
+        periodo_txt = _periodo_txt(anos_per, meses_a1 if unico else meses)
         rotulo_taxa = base_txt + ("" if unico else " ao ano")
 
-        ra_ano = ssp_por_ra_ano(ssp, naturezas, ini, fim)
-        por_ra = _por_ra(ra_ano, anos_per)
+        # Anos em que nenhuma das naturezas escolhidas existia: sem dado, não zero.
+        anos_sem = _anos_sem(naturezas)
+        ra_ano = ssp_por_ra_ano(ssp, naturezas, meses)
+        por_ra = _por_ra(ra_ano, [a for a in anos_per if a not in anos_sem])
         total = por_ra["total"].sum()
         pop_validos = por_ra["pop_validos"].sum()
         taxa = total * BASE_TAXA / pop_validos if pop_validos else None
         pop_a1 = ssp.pop.filter(pl.col("ano") == a1)["populacao"].sum()
-        lacuna = not naturezas or (unico and sem_meses) or not pop_validos
+        lacuna = (not naturezas or (unico and sem_meses) or not pop_validos
+                  or all(a in anos_sem for a in anos_per))
 
         # Comparação só nas RAs com dado nos dois anos: em 2015–2017 e 2023 faltam
         # RAs, e somar todas faria a variação vir da cobertura, não do crime.
-        cmp = (ssp_por_ra_ano(ssp, naturezas, ini, fim_ano)
+        cmp = (ssp_por_ra_ano(ssp, naturezas, meses_a1)
                .filter(pl.col("ano").is_in([ref, a1]) & pl.col("total").is_not_null()))
         por_ra_cmp = (
             cmp.filter(pl.col("ano") == ref).select("cd_subdist", pl.col("total").alias("anterior"))
@@ -1200,7 +1454,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
                   on="cd_subdist")
         )
         tem_ref = (bool(naturezas) and ref in ssp.ultimo_mes and por_ra_cmp.height > 0
-                   and not sem_meses)
+                   and not sem_meses and ref not in anos_sem and a1 not in anos_sem)
         if not tem_ref:
             por_ra_cmp = por_ra_cmp.clear()
         total_ref = por_ra_cmp["anterior"].sum() if tem_ref else None
@@ -1217,14 +1471,52 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
                 "atuação da polícia, não crimes sofridos pela população; com eles, a taxa "
                 "deixa de medir só vitimização.",
             ))
+        contidas = [n for n in naturezas if n in ja_em_homicidio]
+        if contidas and HOMICIDIO_SSP in naturezas:
+            avisos.append((
+                "Feminicídio contado duas vezes.",
+                "O homicídio doloso dos balanços das RAs já inclui os feminicídios. Para somar "
+                "os crimes letais, deixe só o homicídio; para ver os feminicídios, só o "
+                "feminicídio.",
+            ))
+        estupro, vulneravel = NOMES_SSP["ESTUPRO"], NOMES_SSP["ESTUPRO DE VULNERÁVEL"]
+        separacao = min(ssp.anos_natureza.get(vulneravel, {anos[-1] + 1}))
+        if estupro in naturezas and anos_per[0] < separacao:
+            avisos.append((
+                f"Até {separacao - 1}, o estupro das RAs inclui o estupro de vulnerável.",
+                f"Os balanços das RAs só separam os dois a partir de {separacao}. "
+                + ("Com os dois marcados, a soma é comparável em todos os anos."
+                   if vulneravel in naturezas else
+                   "Para comparar anos antes e depois disso, marque também o estupro de "
+                   f"vulnerável: sem ele, a queda de {separacao - 1} para {separacao} vem da "
+                   "separação, não do crime."),
+            ))
+        no_mj = [n for n in (HOMICIDIO_SSP, NOMES_SSP["TENTATIVA DE HOMICÍDIO"]) if n in naturezas]
+        if no_mj:
+            avisos.append((
+                "Diferente da aba Brasil (MJ/Sinesp).",
+                f"{' e '.join(no_mj)}: aqui são ocorrências, com o feminicídio. No MJ, o mesmo "
+                "evento conta vítimas e deixa o feminicídio de fora, então lá o número do DF é "
+                "menor.",
+            ))
+        if contidas:
+            anos_fem = sorted(set().union(*(ssp.anos_natureza[n] for n in contidas)))
+            avisos.append((
+                f"O feminicídio por RA vem dos estudos da CTMHF/SSP-DF ({_faixas(anos_fem)}),",
+                "não dos balanços: são os casos que o sistema de justiça confirma como "
+                "feminicídio consumado. O mês de alguns casos foi reconstruído pela diferença "
+                "entre estudos mensais e pode estar trocado entre meses próximos; os totais por "
+                "RA e ano são os do estudo. A soma do DF pode diferir da aba Brasil (MJ) em "
+                "até 3 casos por ano.",
+            ))
         mes_fim_txt = MESES_EXTENSO[ssp.ultimo_mes[a1] - 1]
         if sem_meses:
             avisos.append((
                 f"{a1} só tem dados até {mes_fim_txt}.",
-                f"Escolha meses até {mes_fim_txt} para ver esse ano.",
+                f"Escolha algum mês até {mes_fim_txt} para ver esse ano.",
             ))
-        elif fim > fim_ano:
-            meses_cmp = f"{MESES_EXTENSO[ini - 1]} a {mes_fim_txt}"
+        elif meses_a1 != meses:
+            meses_cmp = _meses_extenso(meses_a1)
             avisos.append((
                 f"{a1} ainda está em andamento: há dados só até {mes_fim_txt}.",
                 f"Por isso, a variação compara {meses_cmp} de {ref} com {meses_cmp} "
@@ -1261,7 +1553,9 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
         if faltando:
             avisos.append((
                 "Nem toda natureza existe em todos os anos:",
-                "; ".join(faltando) + ". Nos anos em que não aparece, a natureza conta como zero.",
+                "; ".join(faltando) + ". Nos anos em que não aparece, a natureza conta como zero"
+                + (f"; em {_faixas(sorted(anos_sem & set(anos_per)))}, nenhuma das escolhidas "
+                   "existe e o período fica sem dado." if anos_sem & set(anos_per) else "."),
             ))
         antes = {cd: mae for (cd, a), mae in nao_existia.items() if a in anos_per}
         if antes:
@@ -1288,12 +1582,15 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
                     if com_dp.height else None)
         lider = (por_ra.sort("taxa", descending=True, nulls_last=True).row(0, named=True)
                  if total else None)
-        if unico:
-            nota_var = (f"{fmt(total_ref)} em {_periodo_txt(ref, ref, ini, fim_ano)}"
+        if naturezas and (ref in anos_sem or a1 in anos_sem):
+            nota_var = (f"As naturezas escolhidas não existem em "
+                        f"{ref if ref in anos_sem else a1}")
+        elif unico:
+            nota_var = (f"{fmt(total_ref)} em {_periodo_txt([ref], meses_a1)}"
                         if tem_ref else "Sem ano anterior comparável")
         else:
-            nota_var = (f"{_periodo_txt(ref, ref, ini, fim_ano)}: {fmt(total_ref)} → "
-                        f"{_periodo_txt(a1, a1, ini, fim_ano)}: {fmt(total_alvo)}"
+            nota_var = (f"{_periodo_txt([ref], meses_a1)}: {fmt(total_ref)} → "
+                        f"{_periodo_txt([a1], meses_a1)}: {fmt(total_alvo)}"
                         if tem_ref else f"Sem dado comparável em {ref} ou {a1}")
         if tem_ref and por_ra_cmp.height < ssp.ras.height:
             nota_var += f" · só as {por_ra_cmp.height} RAs com dado nos dois anos"
@@ -1338,24 +1635,46 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
                 on=["ano", "mes"], how="left")
             .with_columns(pl.col("valor").fill_null(0))
             .sort("ano", "mes")
-            .with_columns(pl.col("valor").rolling_mean(12).alias("media"))
         )
+        inicio = _inicio(naturezas)
+        if inicio is not None:
+            mensal = mensal.with_columns(
+                pl.when(pl.col("ano") * 100 + pl.col("mes") < inicio[0] * 100 + inicio[1])
+                .then(None).otherwise(pl.col("valor")).alias("valor"))
+        mensal = mensal.with_columns(pl.col("valor").rolling_mean(12).alias("media"))
         datas = [f"{a}-{m:02d}-01" for a, m in mensal.select("ano", "mes").rows()]
         hover_m = []
         for a, m, v, md in mensal.select("ano", "mes", "valor", "media").rows():
-            txt = f"<b>{MARCAS_MESES[m]}/{a}</b><br>{fmt(v)} ocorrências"
+            txt = (f"<b>{MARCAS_MESES[m]}/{a}</b><br>"
+                   + ("sem dado: as naturezas escolhidas ainda não existiam" if v is None
+                      else f"{fmt(v)} ocorrências"))
             if md is not None:
                 txt += f"<br>média de 12 meses: {fmt(md)}"
-            if faltam_mes.get((a, m)):
+            if v is not None and faltam_mes.get((a, m)):
                 txt += f"<br>{faltam_mes[(a, m)]} RA(s) sem dado no mês, fora da soma"
             hover_m.append(txt)
-        faixa = (f"{a0}-{ini:02d}-01", f"{a1}-{fim_ano:02d}-28")
         serie = _serie_historica(datas, mensal["valor"].to_list(), mensal["media"].to_list(),
-                                 hover_m, faixa, 320)
+                                 hover_m, _faixas_serie(anos_per, meses, ssp.ultimo_mes), 320)
         serie_sub = ("Ocorrências por mês, somando as RAs, e média dos 12 meses anteriores. "
                      f"A faixa marca {anos_txt}; clique num mês para ver só aquele ano. Nos "
                      "meses em que falta alguma RA, o total fica abaixo do real: para comparar "
                      "anos, use a taxa da comparação anual.")
+        valores_modelo, fora_modelo = _serie_para_modelo(naturezas)
+        ultimo_txt = f"{MESES_EXTENSO[meses_cal[-1][1] - 1]} de {meses_cal[-1][0]}"
+        nomes_fora = ", ".join(_nome_natureza(n) for n in fora_modelo)
+        serie_modelo = {"datas": datas, "valores": valores_modelo,
+                        "unidade": "ocorrências", "casas": 0,
+                        "obs": (f"Ficam fora da previsão, por não terem dado em {ultimo_txt}: "
+                                f"{nomes_fora}."
+                                if fora_modelo and len(fora_modelo) < len(naturezas) else "")}
+        # Todas as escolhidas saíram dos balanços antes do fim da série (FURTO A
+        # TRANSEUNTE não sai em 2026): sem isso, o motivo seria "poucos meses".
+        if fora_modelo and len(fora_modelo) == len(naturezas):
+            ultimo_ano = max(max(ssp.anos_natureza[n]) for n in fora_modelo)
+            serie_modelo["motivo"] = (
+                f"{nomes_fora} {'não aparece' if len(fora_modelo) == 1 else 'não aparecem'} "
+                f"nos balanços depois de {ultimo_ano}, e a série precisa ter dado no último "
+                f"mês ({ultimo_txt})")
 
         # --- comparação anual: taxa do DF só com as RAs que têm dado no ano --
         anual = (
@@ -1363,15 +1682,22 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
             .join(ra_ano.filter(pl.col("total").is_not_null()).group_by("ano")
                   .agg(pl.col("total").sum(), pl.col("populacao").sum(), pl.len().alias("n_ras")),
                   on="ano", how="left")
+            .with_columns(
+                pl.when(pl.col("ano").is_in(list(anos_sem))).then(None)
+                .otherwise(pl.col("total")).alias("total"))
             .with_columns((pl.col("total") * BASE_TAXA / pl.col("populacao")).alias("taxa"))
             .sort("ano")
         )
         n_existentes = {a: ssp.ras.height - sum(1 for (_, x) in nao_existia if x == a)
                         for a in anos}
-        parcial = {a for a in anos if ssp.ultimo_mes[a] < fim}
+        parcial = {a for a in anos if ssp.ultimo_mes[a] < meses[-1]}
         linhas = anual.to_dicts()
         hover_a = []
         for i, r in enumerate(linhas):
+            if r["ano"] in anos_sem:
+                hover_a.append(f"<b>{r['ano']}</b><br>sem dado: as naturezas escolhidas "
+                               "ainda não existiam")
+                continue
             txt = (f"<b>{r['ano']}</b>"
                    + (f" (até {MARCAS_MESES[ssp.ultimo_mes[r['ano']]]})" if r["ano"] in parcial else "")
                    + f"<br>{fmt(r['taxa'], 2)} {base_txt}<br>{fmt(r['total'])} ocorrências")
@@ -1385,7 +1711,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
         anual_fig = go.Figure(go.Bar(
             x=[str(a) for a in anual["ano"]], y=anual["taxa"].to_list(),
             marker=dict(
-                color=[AZUL if a0 <= a <= a1 else AZUL_CLARO for a in anual["ano"]],
+                color=[AZUL if a in anos_per else AZUL_CLARO for a in anual["ano"]],
                 pattern=dict(shape=["/" if a in parcial else "" for a in anual["ano"]],
                              fgcolor="white", solidity=0.3),
                 cornerradius=4,
@@ -1394,9 +1720,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
         ))
         _estilo(anual_fig, 320, bargap=0.3)
         anual_fig.update_xaxes(type="category")
-        meses_txt = ("ano inteiro" if (ini, fim) == (1, 12)
-                     else f"só {MARCAS_MESES[ini]}–{MARCAS_MESES[fim]}" if ini != fim
-                     else f"só {MARCAS_MESES[ini]}")
+        meses_txt = _recorte_txt(meses)
         anual_sub = (f"Taxa do DF {base_txt} ({meses_txt}, em todos os anos), só com as RAs que "
                      f"têm dado no ano. Em destaque, {anos_txt}"
                      + ("; hachurado, ano ainda incompleto" if parcial else "")
@@ -1405,6 +1729,8 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
 
         # --- mapa de calor: RA × ano ------------------------------------------
         def txt_celula(cd, a, v, t):
+            if a in anos_sem:
+                return "as naturezas escolhidas ainda não existiam"
             if (cd, a) in nao_existia:
                 return f"RA ainda não existia: dados em {nome_ra[nao_existia[(cd, a)]]}"
             if (cd, a) in ausentes_set:
@@ -1417,6 +1743,9 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
             ssp.ras.select("cd_subdist", "ra")
             .join(pl.DataFrame({"ano": anos}), how="cross")
             .join(ra_ano, on=["cd_subdist", "ano"], how="left")
+            .with_columns(
+                pl.when(pl.col("ano").is_in(list(anos_sem))).then(None)
+                .otherwise(pl.col("total")).alias("total"))
             .with_columns((pl.col("total") * BASE_TAXA / pl.col("populacao")).alias("taxa"))
         )
         calor = calor.with_columns(pl.Series("txt", [
@@ -1447,7 +1776,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
                                ticksuffix="  ", tickfont=dict(size=11))
         calor_sub = (f"Taxa {base_txt} de cada RA em cada ano ({meses_txt}), da maior para a "
                      f"menor taxa em {anos_txt}. Cinza: RA sem balanço válido, balanço sem os "
-                     "meses do recorte ou RA ainda não criada."
+                     "meses do recorte, RA ainda não criada ou natureza que ainda não existia."
                      + (" *Ano ainda incompleto." if parcial else "")
                      + " Clique numa célula para ver só aquele ano.")
 
@@ -1496,7 +1825,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
         anual_sub, ranking_sub, calor_sub = (
             t.replace("..", ".") for t in (anual_sub, ranking_sub, calor_sub))
         return (aviso, kpis, ranking, ranking_titulo, ranking_sub,
-                serie, serie_sub, anual_fig, anual_sub, calor_fig, calor_sub,
+                serie, serie_sub, serie_modelo, anual_fig, anual_sub, calor_fig, calor_sub,
                 tabela.to_dicts(), colunas)
 
 
@@ -1541,9 +1870,8 @@ def criar_app() -> Dash:
                        f"{mj.anos[-1]}; SSP-DF — balanços por Região Administrativa {anos_ssp}; "
                        "IBGE — estimativas de população, Censo 2022 e malhas territoriais."),
                 html.P("População no MJ: a do município no ano (estimativa do IBGE; Censo "
-                       "em 2022; média entre Censo 2022 e estimativa de 2024 em 2023). O IBGE "
-                       "refaz as estimativas a cada Censo, então parte da variação da taxa "
-                       "entre anos pode vir da população."),
+                       "2022 em 2022 e 2023). O IBGE refaz as estimativas a cada Censo, então "
+                       "parte da variação da taxa entre anos pode vir da população."),
                 html.P("População no DF: a estimativa do IBGE para o DF no ano, rateada entre "
                        "as RAs pela participação de cada uma no Censo 2022 (o IBGE não estima "
                        "população abaixo do município). As delegacias são as de hoje, em "
@@ -1574,4 +1902,6 @@ def criar_app() -> Dash:
 
     _registrar_mj(app, mj)
     _registrar_ssp(app, ssp)
+    _registrar_previsao(app, "mj")
+    _registrar_previsao(app, "ssp")
     return app

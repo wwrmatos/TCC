@@ -10,7 +10,11 @@ Faz, para todos os anos de `ssp_df_ra_consolidado.csv` (gerado por
   `tcc.populacao.populacao_ra_por_ano`). `populacao_censo` continua sendo a do
   Censo 2022;
 - a linha do DF inteiro (`ra_numero` 0, sem `cd_subdist`), com a população do
-  DF no ano, e as colunas `contagem`, `fonte` e `arquivo` do consolidado.
+  DF no ano, e as colunas `contagem`, `fonte` e `arquivo` do consolidado;
+- os feminicídios por RA dos estudos da CTMHF (2023–2026)
+  (`ssp_df_feminicidio_ra.csv`, de `scripts/extrair_feminicidio_ctmhf.py`), no
+  eixo próprio `5. FEMINICÍDIO - CTMHF`, só até o último mês dos balanços de
+  cada ano, para o ano corrente cobrir os mesmos meses das outras naturezas.
 
 Antes, gere as estimativas com `scripts/baixar_populacao_ibge.py`.
 
@@ -25,11 +29,22 @@ import polars as pl
 from tcc.dimensoes import CODIGO_MUNICIPIO_DF, carregar_dimensao_geografica, juntar_dimensoes, sem_dimensao
 from tcc.geo import agregar_delegacias_por_ra, carregar_setores, delegacias_com_subdistrito
 from tcc.mj import carregar_censo_por_municipio
-from tcc.paths import SSP_RA_CONSOLIDADO_CSV, SSP_RA_GEO_PARQUET
+from tcc.paths import (
+    MJ_CENSO_GEO_PARQUET,
+    SSP_FEMINICIDIO_RA_CSV,
+    SSP_RA_CONSOLIDADO_CSV,
+    SSP_RA_GEO_PARQUET,
+)
 from tcc.populacao import carregar_populacao, populacao_municipal_por_ano, populacao_ra_por_ano
 from tcc.ssp_df import RA_NUMERO_PARA_CD_SUBDIST
 
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+
+# Casos de diferença tolerados, num ano, entre o feminicídio por RA da CTMHF e o
+# do MJ no DF (soma das diferenças de cada mês). Diferenças pequenas vêm de casos
+# que as fontes datam em meses diferentes; mais que isso, algo está errado. O
+# mesmo limite está em `scripts/extrair_feminicidio_ctmhf.py`.
+TOLERANCIA_FEMINICIDIO = 3
 
 # As de `ssp_dp_geo.csv` (juntar_dimensoes.py), com o número da RA, a população
 # do ano ao lado da do Censo, o tipo de contagem e a procedência de cada linha.
@@ -44,8 +59,54 @@ _COLUNAS = [
 ]
 
 
+def _feminicidio_ctmhf(balancos: pl.DataFrame) -> pl.DataFrame:
+    """Feminicídios da CTMHF por RA, cortados no último mês com dado nos
+    balanços de cada ano; o total é refeito com os meses que ficam."""
+    fem = pl.read_csv(SSP_FEMINICIDIO_RA_CSV, infer_schema_length=None)
+    ultimo_mes = {
+        ano: max(i + 1 for i, m in enumerate(MESES) if g[m].is_not_null().any())
+        for (ano,), g in balancos.group_by("ano")
+    }
+    sem_balanco = sorted(set(fem["ano"]) - set(ultimo_mes))
+    if sem_balanco:
+        raise ValueError(f"Feminicídios da CTMHF em anos sem balanço: {sem_balanco}")
+    corte = pl.col("ano").replace_strict(ultimo_mes)
+    fem = fem.with_columns(
+        pl.when(pl.lit(i + 1) <= corte).then(pl.col(m)).otherwise(None).alias(m)
+        for i, m in enumerate(MESES)
+    )
+    fem = fem.with_columns(pl.sum_horizontal(MESES).alias("total")).select(balancos.columns)
+
+    _conferir_com_mj(fem)
+    return fem
+
+
+def _conferir_com_mj(fem: pl.DataFrame) -> None:
+    """A soma das RAs tem de ficar perto do feminicídio do DF no MJ/Sinesp, mês a
+    mês (até :data:`TOLERANCIA_FEMINICIDIO` casos no ano): senão os painéis do DF
+    e do MJ divergem."""
+    mj = (
+        pl.scan_parquet(MJ_CENSO_GEO_PARQUET)
+        .filter((pl.col("sigla_uf") == "DF") & (pl.col("evento") == "Feminicídio")
+                & (pl.col("abrangencia") == "Estadual"))
+        .group_by("ano", pl.col("data_referencia").dt.month().alias("mes"))
+        .agg(pl.col("total_vitima").sum())
+        .collect()
+    )
+    mj = {(a, m): v for a, m, v in mj.rows()}
+    for ano, *meses in fem.group_by("ano").agg(pl.col(MESES).sum()).sort("ano").rows():
+        dif = sum(abs(v - mj.get((ano, m), 0))
+                  for m, v in enumerate(meses, start=1) if v is not None)
+        if dif > TOLERANCIA_FEMINICIDIO:
+            raise ValueError(f"Feminicídio {ano}: a soma das RAs difere do MJ em {dif:.0f} casos, "
+                             "mês a mês. Rode scripts/extrair_feminicidio_ctmhf.py.")
+        if dif:
+            print(f"Feminicídio {ano}: a soma das RAs difere do MJ em {dif:.0f} caso(s), mês a mês")
+
+
 def main() -> None:
-    ssp = pl.read_csv(SSP_RA_CONSOLIDADO_CSV, infer_schema_length=None).with_columns(
+    balancos = pl.read_csv(SSP_RA_CONSOLIDADO_CSV, infer_schema_length=None)
+    ssp = pl.concat([balancos, _feminicidio_ctmhf(balancos)], how="vertical_relaxed").with_columns(
         pl.col("ra_numero").replace_strict(RA_NUMERO_PARA_CD_SUBDIST, default=None,
                                            return_dtype=pl.String).alias("cd_subdist"),
         # O rótulo do eixo vem com espaçamento irregular nas planilhas.

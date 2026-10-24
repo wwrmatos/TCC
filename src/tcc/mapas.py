@@ -26,6 +26,11 @@ from tcc.populacao import BASE_TAXA
 # é circular. Ficam disponíveis no painel, apenas desmarcados por padrão.
 EIXO_FORA_DA_TAXA = "4."
 
+# Prefixo do eixo dos feminicídios por RA da CTMHF (2023–2026). O HOMICÍDIO dos
+# balanços das RAs já inclui os feminicídios, então somar os dois contaria cada
+# caso duas vezes. Fica disponível no painel, desmarcado por padrão.
+EIXO_JA_EM_HOMICIDIO = "5."
+
 
 @dataclass(frozen=True)
 class DadosMapa:
@@ -72,7 +77,8 @@ def preparar_dados(ssp_dp: pl.DataFrame) -> DadosMapa:
     naturezas = sorted(ssp_dp["natureza"].drop_nulls().unique().to_list())
     grupos = _agrupar_por_eixo(ssp_dp)
     padrao = [
-        n for g in grupos if not g["fora_taxa"] for n in g["naturezas"]
+        n for g in grupos if not (g["fora_taxa"] or g["ja_em_homicidio"])
+        for n in g["naturezas"]
     ]
     populacao = {
         r["cd_subdist"]: int(r["populacao"])
@@ -99,6 +105,7 @@ def _agrupar_por_eixo(ssp_dp: pl.DataFrame) -> list[dict]:
             "eixo": eixo,
             "naturezas": sorted(nats),
             "fora_taxa": eixo.startswith(EIXO_FORA_DA_TAXA),
+            "ja_em_homicidio": eixo.startswith(EIXO_JA_EM_HOMICIDIO),
         }
         for eixo, nats in sorted(por_eixo.items())
     ]
@@ -309,6 +316,10 @@ function _fmtT(v){
     if(g.fora_taxa){
       var w=document.createElement('span'); w.className='grpwarn';
       w.textContent='registro gerado pela polícia — fora da taxa por padrão';
+      gl.appendChild(w);
+    } else if(g.ja_em_homicidio){
+      var w=document.createElement('span'); w.className='grpwarn';
+      w.textContent='já contado no homicídio doloso — fora do padrão';
       gl.appendChild(w);
     }
     h.appendChild(gcb); h.appendChild(gl); c.appendChild(h);
@@ -606,6 +617,10 @@ function bfInitCbs(){
     if(g.fora_taxa){
       var w=document.createElement('span'); w.className='grpwarn2';
       w.textContent='registro gerado pela polícia — fora da taxa por padrão';
+      gl.appendChild(w);
+    } else if(g.ja_em_homicidio){
+      var w=document.createElement('span'); w.className='grpwarn2';
+      w.textContent='já contado no homicídio doloso — fora do padrão';
       gl.appendChild(w);
     }
     h.appendChild(gcb); h.appendChild(gl); c.appendChild(h);

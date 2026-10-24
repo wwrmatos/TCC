@@ -86,6 +86,30 @@ body {
 }
 .botao:hover { border-color: var(--destaque); color: var(--destaque); }
 
+/* Anos e meses: cada opção é um botão que liga e desliga. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips label {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--borda);
+  background: var(--surface-0);
+  color: var(--texto-2);
+  border-radius: 999px;
+  padding: 3px 11px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  user-select: none;
+}
+.chips label:hover { border-color: var(--destaque); color: var(--destaque); }
+.chips input { position: absolute; opacity: 0; pointer-events: none; }
+.chips label:has(input:checked) {
+  background: var(--destaque);
+  border-color: var(--destaque);
+  color: #fff;
+}
+.chips label:has(input:focus-visible) { outline: 2px solid var(--destaque); outline-offset: 2px; }
+
 .radio label, .checklist label { margin-right: 14px; font-size: 13px; color: var(--texto-2); }
 .radio input, .checklist input { margin-right: 5px; accent-color: var(--destaque); }
 /* Título de categoria no seletor de eventos (opção desabilitada). */
@@ -101,6 +125,8 @@ body {
   margin-bottom: 16px;
 }
 .aviso:empty { display: none; }
+/* "Sem previsão", abaixo do gráfico da série mensal. */
+.aviso--previsao { margin: 8px 0 0; }
 .aviso ul { margin: 6px 0 0; padding-left: 18px; }
 .aviso li { margin: 4px 0; line-height: 1.45; }
 

@@ -45,16 +45,18 @@ Lê as bases finais `data/processed/mj_censo_geo.parquet` (gerada por
 `scripts/consolidar_ssp.py`), ver abaixo, e, na primeira execução, baixa as malhas de UF e município do IBGE para
 `data/malhas/`. São duas abas:
 
-- **Brasil — MJ/Sinesp (2016–2026)**: evento, localidade, abrangência,
-  intervalo de anos e meses (os meses valem em cada ano do intervalo). A série
+- **Brasil — MJ/Sinesp (2016–2026)**: evento, localidade, abrangência, anos e
+  meses. Anos e meses são botões que ligam e desligam, em qualquer combinação
+  (fevereiro e dezembro de 2016 e 2025, por exemplo), com atalhos (todos os anos,
+  último ano completo, ano todo, limpar); os meses valem em cada ano escolhido. A série
   histórica cobre todo o período: evolução mensal com média de 12 meses,
   comparação anual (os mesmos meses em todos os anos) e mapa de calor UF × ano
   (ou, numa UF, os 20 maiores municípios × ano). KPIs, mapa coroplético por UF
   (clicar numa UF abre os municípios dela), ranking, vítimas por sexo e tabela
   somam os anos escolhidos. Com um ano só, a variação é sobre o ano anterior;
-  com um intervalo, é do primeiro para o último ano, nos mesmos meses. Clicar
+  com vários, é do primeiro para o último ano escolhido, nos mesmos meses. Clicar
   num ano em qualquer gráfico da série seleciona só aquele ano. Taxa por 100 mil
-  habitantes, com a população do próprio ano; num intervalo, é a média anual
+  habitantes, com a população do próprio ano; com vários anos, é a média anual
   (soma dos registros ÷ soma das populações).
   Quando uma UF tem o ano inteiro zerado num evento que ela registra com
   frequência nos outros anos (média ≥ 12 por ano), o painel trata o ano como
@@ -75,17 +77,65 @@ Lê as bases finais `data/processed/mj_censo_geo.parquet` (gerada por
   drogas —, com aviso quando falta um dos membros numa UF. A lista fica em
   `CATEGORIAS_MJ` (`src/tcc/painel/dados.py`).
 - **Distrito Federal — SSP-DF (2015–2026)**: naturezas (com atalhos por eixo),
-  intervalo de anos e meses, como na aba do MJ. Os mapas folium deste
+  anos e meses, como na aba do MJ. Os mapas folium deste
   repositório (coroplético/bolhas) abrem com a seleção do painel; há taxa por RA
   destacando as RAs sem delegacia, série mensal com média de 12 meses,
   comparação anual da taxa do DF, mapa de calor RA × ano e tabela. Taxa por mil
-  habitantes; num intervalo, é a média anual. Os totais do DF são a soma das
+  habitantes; com vários anos, é a média anual. Os totais do DF são a soma das
   RAs, não o balanço do DF, que separa naturezas (feminicídio, estupro de
-  vulnerável) que o das RAs não separa. RA/ano sem balanço válido (Sobradinho
+  vulnerável) que o das RAs não separa. De 2023 a 2026, o feminicídio por RA vem
+  dos estudos da CTMHF (ver abaixo), num eixo à parte e fora do padrão, porque
+  já está contado no HOMICÍDIO. Nos anos e meses em que nenhuma das naturezas
+  escolhidas existe (feminicídio sozinho antes de 2025, por exemplo), a série
+  mensal, a comparação anual, o mapa de calor e a variação ficam sem dado, em vez
+  de zero; a taxa média de vários anos usa só os anos com dado. Se ao menos uma
+  das escolhidas existe no ano, as outras contam como zero, como antes. RA/ano sem balanço válido (Sobradinho
   2015–2016, Planaltina 2016–2017, Riacho Fundo 2017, Sudoeste 2023) fica fora
   do total e da taxa, com aviso. A variação usa só as RAs com dado nos dois anos.
   As delegacias são as de hoje em todos os anos. `?aba=ssp` na URL abre direto
   nesta aba.
+
+**Nomes dos eventos.** O que existe nas duas fontes tem o mesmo nome nas duas
+abas (`NOMES_MJ` e `NOMES_SSP` em `src/tcc/painel/dados.py`): homicídio doloso,
+feminicídio, latrocínio, lesão corporal seguida de morte, tentativa de homicídio,
+estupro, estupro de vulnerável, roubo de veículo e tráfico de drogas. O homicídio
+e a tentativa de homicídio das RAs incluem o feminicídio e a tentativa de
+feminicídio, que o Sinesp separa, e o nome diz isso. O que só existe numa fonte
+(furto de veículo e arma de fogo apreendida no MJ; roubo a transeunte,
+posse/porte de arma etc. na SSP-DF) mantém o nome da fonte, na SSP-DF em caixa
+normal. A unidade só aparece no seletor do MJ quando é kg.
+
+**MJ × SSP-DF no DF.** Mesmo com o nome igual, nem todo evento bate entre as
+abas. Quando não bate, as duas abas avisam e explicam (`DIFERENCA_DF_MJ` em
+`app.py`):
+
+| Evento | Situação |
+| --- | --- |
+| Feminicídio, latrocínio, lesão corporal seguida de morte, roubo de veículo | Batem (roubo de veículo com 0 a 2 de diferença por mês) |
+| Homicídio doloso | O MJ conta vítimas sem feminicídio (desde 2023, igual às vítimas do balanço do DF; antes, vítimas do balanço menos feminicídio); as RAs, ocorrências com feminicídio |
+| Tentativa de homicídio | O MJ conta vítimas sem tentativa de feminicídio; as RAs, ocorrências com ela |
+| Estupro, estupro de vulnerável | Até 2024, o estupro das RAs inclui o de vulnerável. Somados, batem (até 5%) em 2016, 2019, 2022, 2023 e 2026; em 2018, 2020, 2021 e 2024 o MJ tem 14% a 24% a mais, e em 2025, 12% a menos, sem causa identificada |
+| Tráfico de drogas | O MJ soma a Polícia Federal, que a SSP-DF não tem; no DF, o filtro de abrangência abre só com a Estadual. Assim batem exatamente em 2016–2021 e com até 2% depois, menos 2025 (+5% no MJ, sem causa identificada) |
+
+**Previsão nas séries mensais.** Os dois gráficos de evolução mensal trazem,
+em laranja pontilhado, a previsão dos 12 meses seguintes com intervalo de 95%
+(`src/tcc/previsao.py`). O modelo é um SARIMA(p,d,q)(P,D,Q)₁₂ sobre `log1p` da
+contagem mensal, reajustado a cada filtro: `d` pelo teste KPSS, `D` pela força
+da sazonalidade na STL (> 0,64) e `p`, `q` ≤ 2, `P`, `Q` ≤ 1 pelo menor AIC, na
+busca stepwise do `auto.arima` (Hyndman & Khandakar, 2008). Abaixo do gráfico,
+o painel mostra o modelo escolhido e o erro absoluto médio nos últimos 12
+meses, com o modelo ajustado sem eles, ao lado do erro do sazonal ingênuo
+(repetir o mesmo mês do ano anterior). Quando o modelo não supera o ingênuo, o
+painel avisa. Não há previsão para séries com menos de 48 meses de dado, média
+abaixo de 5 por mês ou mais de 30% de meses zerados. Meses sem dado entram como
+faltantes, não como zero: no MJ, os anos em que a UF não enviou dados; na
+SSP-DF, os meses em que falta alguma RA (2015–2017 e 2023) e os meses em que uma
+natureza some do balanço (TRÁFICO DE DROGAS e POSSE/PORTE DE ARMA em 2019, por
+exemplo). Naturezas sem registro no último mês, como FURTO A TRANSEUNTE em
+2026, ficam fora da previsão. No Brasil inteiro, as UFs que não enviaram dados
+em algum ano continuam somando zero, então parte da tendência pode vir da
+cobertura. O ajuste leva até ~5 s e roda num callback à parte, depois do resto
+da página; filtros repetidos usam cache.
 
 ### Série histórica do MJ/Sinesp (2016–2026)
 
@@ -105,7 +155,7 @@ continua sendo a do Censo 2022:
 | --- | --- |
 | 2016–2021, 2024–2026 | Estimativa do IBGE do ano (SIDRA, tabela 6579) |
 | 2022 | Censo 2022 (o IBGE não publica estimativa municipal no ano do Censo) |
-| 2023 | Média entre o Censo 2022 e a estimativa de 2024 (o IBGE não publicou 2023) |
+| 2023 | Censo 2022 (o IBGE não publicou estimativa municipal para 2023) |
 
 As estimativas de anos diferentes não formam uma série contínua: o IBGE refaz a
 projeção a cada Censo. Brasília, por exemplo, passa de 3,04 milhões em 2017 para
@@ -123,6 +173,7 @@ cabeçalho de cada um, então rodam com `uv run --script`):
 uvx playwright install chromium                  # só na primeira vez
 uv run --script scripts/baixar_ssp_ra.py         # baixa PDFs/planilhas → data/ssp_df_ra_bruto/
 uv run --script scripts/consolidar_ssp_ra.py     # junta tudo → data/processed/ssp_df_ra_consolidado.csv
+uv run --script scripts/extrair_feminicidio_ctmhf.py  # feminicídios por RA 2023–2026 → data/processed/ssp_df_feminicidio_ra.csv (depois de consolidar_mj.py)
 uv run python scripts/consolidar_ssp.py          # + dimensões, delegacias e população → data/processed/ssp_ra_geo.parquet
 ```
 
@@ -132,7 +183,7 @@ população **da RA naquele ano**, num Parquet com as colunas do `ssp_dp_geo.csv
 mais `ra_numero`, `populacao_censo` (Censo 2022), `fonte_populacao`, `contagem`,
 `fonte` e `arquivo`; `populacao` passa a ser a do ano. O IBGE não estima
 população abaixo do município, então a do DF no ano (a mesma regra do MJ:
-estimativa; Censo em 2022; média Censo 2022–estimativa 2024 em 2023) é rateada
+estimativa; Censo 2022 em 2022 e 2023) é rateada
 pela participação de cada RA no Censo 2022. Isso supõe participação constante
 entre os anos: em 2018–2019 a população de RAs que cresceram rápido fica
 superestimada, e a das que perderam gente, subestimada. Antes de 2020, a
@@ -206,7 +257,9 @@ do link:
 
 - **Naturezas que mudam com o tempo.** 2019 não tem o eixo 4 (PRODUTIVIDADE
   POLICIAL), nem na planilha nem no PDF. 2015 não tem TENTATIVA DE LATROCÍNIO.
-  ESTUPRO DE VULNERÁVEL aparece nas RAs a partir de 2025 e no DF a partir de 2023.
+  ESTUPRO DE VULNERÁVEL aparece separado nas RAs a partir de 2025 e no DF a partir
+  de 2024; até 2024, o ESTUPRO das RAs inclui o de vulnerável (em 2024, 939 = 319 +
+  620 do DF), e o painel avisa quando o estupro é selecionado nesses anos.
   FEMINICÍDIO e TENTATIVA DE FEMINICÍDIO só existem no DF, a partir de 2023.
 - **Homicídio do DF × soma das RAs.** A partir de 2023, o balanço do DF separa
   FEMINICÍDIO de HOMICÍDIO e o das RAs não separa. Para comparar, use o HOMICÍDIO
@@ -219,6 +272,56 @@ do link:
   unificadas, e os asteriscos de nota de rodapé ("ROUBO EM COMÉRCIO *") são
   removidos.
 - **Arniqueira e Sol Nascente/Pôr do Sol** só têm dados a partir de 2020.
+
+#### Feminicídio por RA (CTMHF, 2023–2026)
+
+Os balanços das RAs não separam o feminicídio do HOMICÍDIO. Para tê-lo por RA,
+`extrair_feminicidio_ctmhf.py` lê os estudos mensais da Câmara Técnica de
+Monitoramento de Homicídios e Feminicídios (CTMHF/SSP-DF), baixados à mão em
+`data/dados_ssp_df/feeminicidio/<ano>/<Mês>.pdf` (hoje, jan/2021 a set/2026). Cada estudo é acumulado desde março de 2015 e traz casos por RA × ano
+e, na maioria, por mês × ano no DF, mas não RA × mês. O mês de cada
+caso por RA sai da diferença entre estudos consecutivos: os casos novos de uma
+RA entram no mês que cresceu na TABELA 03. Os estudos também revisam casos
+antigos (um caso deixa de ser feminicídio, muda de RA ou de mês), e a
+reconstrução usa o menor número de revisões que explica cada estudo.
+
+- **Anos cobertos.** Entra o ano que tem estudo de quase todos os meses (podem
+  faltar até 2). De maio/2021 a fevereiro/2023, os estudos não trazem a tabela
+  por mês × ano, só um gráfico "mês do fato" que soma todos os anos, e são
+  ignorados; por isso 2021 e 2022 ficam de fora, e 2023 começa no estudo de
+  março (os casos de janeiro a março entram juntos). De 2015 a 2020 não há como
+  separar o mês dos casos de cada RA.
+
+- **Mês incerto.** Quando um estudo traz casos novos de RAs diferentes em meses
+  diferentes, a combinação RA × mês não fica determinada. São 24 dos 97 casos
+  (12 em 2023, pelo começo em março; 4 em 2024; 3 em 2025; 5 em 2026), marcados
+  com `mes_incerto` em
+  `data/processed/ssp_df_feminicidio_casos.csv`. Os totais por RA × ano e por
+  mês no DF são exatamente os do estudo usado.
+- **Perto do MJ.** Os estudos seguem incluindo casos de anos fechados (um
+  homicídio que o processo passa a tratar como feminicídio) e tirando outros: o
+  de setembro/2026 tem 29 casos em 2025, e o MJ/Sinesp, 28 — a diferença é um
+  caso de Paranoá de novembro/2025, incluído pela CTMHF em janeiro/2026. Para os
+  dois painéis baterem, cada ano usa o estudo mais recente cuja contagem mensal
+  do DF coincide com a do MJ (2024: maio/2026; 2025: dezembro/2025; 2026:
+  setembro/2026). Sem nenhum igual, usa o que menos difere, se a diferença for
+  de até 3 casos no ano, somando as diferenças de cada mês (`TOLERANCIA_MJ`);
+  acima disso, o ano fica de fora. 2023 usa o estudo de outubro/2025 e tem 30
+  casos contra 31 no MJ (um caso em maio, e não junho, e um de outubro a menos).
+  `consolidar_ssp.py` repete a conferência com o mesmo limite e para com erro
+  acima dele. Por isso `extrair_feminicidio_ctmhf.py` roda depois de
+  `consolidar_mj.py`.
+- **Já está no HOMICÍDIO.** No painel, o FEMINICÍDIO fica num eixo próprio,
+  `5. FEMINICÍDIO - CTMHF`, fora da seleção padrão, e o painel avisa quando ele
+  é somado ao HOMICÍDIO.
+- **Ano corrente.** `consolidar_ssp.py` corta os meses que os balanços ainda
+  não têm (2026 vai até agosto), para o feminicídio cobrir o mesmo período das
+  outras naturezas.
+- Arapoanga e Água Quente, que a CTMHF já separa, vão para Planaltina e
+  Recanto das Emas, como nos balanços. Rótulos de RA cortados com reticências
+  no PDF ("Pôr do Sol / Sol Na…") valem pelo começo.
+- **RA sem balanço.** O CSV tem as 33 RAs em todos os anos, mas RA/ano sem
+  balanço válido (Sudoeste/Octogonal 2023) continua fora do total e da taxa.
 
 Para os notebooks:
 
@@ -234,6 +337,7 @@ src/tcc/          # pacote com toda a lógica reutilizável
   dimensoes.py    # dimensões município / UF / região e a junção às bases finais
   ssp_df.py       # parser das planilhas da SSP-DF
   populacao.py    # população por RA e cálculo da taxa
+  previsao.py     # previsão SARIMA das séries mensais do painel
   geo.py          # setores censitários, delegacias e o spatial join
   mapas.py        # construção dos dois mapas folium
   malhas.py       # malhas de UF/município do IBGE, com cache em data/malhas/
@@ -244,6 +348,7 @@ scripts/
   juntar_dimensoes.py  # anexa município/UF/região às bases finais
   baixar_ssp_ra.py     # scraper (Playwright) dos balanços da SSP-DF por RA, 2015–2026
   consolidar_ssp_ra.py # junta os PDFs/planilhas baixados num CSV único
+  extrair_feminicidio_ctmhf.py  # feminicídios por RA e mês (2023–2026) dos estudos da CTMHF
   baixar_populacao_ibge.py  # estimativas anuais de população por município (SIDRA)
   consolidar_mj.py     # BancoVDE 2016–2026 + Censo + dimensões + população do ano
   consolidar_ssp.py    # série da SSP-DF 2015–2026 + dimensões + delegacias + população do ano

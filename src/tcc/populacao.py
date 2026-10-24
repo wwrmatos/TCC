@@ -39,7 +39,8 @@ def taxa(total: int | float | None, populacao: int | None) -> float | None:
 # População municipal por ano (para as taxas do MJ/Sinesp)
 # ---------------------------------------------------------------------------
 
-ANO_CENSO = 2022
+# Anos sem estimativa municipal do IBGE, que usam a contagem do Censo 2022.
+ANOS_COM_CENSO = (2022, 2023)
 
 
 def populacao_municipal_por_ano(anos: list[int], censo: pl.DataFrame) -> pl.DataFrame:
@@ -48,12 +49,9 @@ def populacao_municipal_por_ano(anos: list[int], censo: pl.DataFrame) -> pl.Data
 
     Usa a estimativa do IBGE do próprio ano (`data/ibge_populacao_estimada.csv`,
     gerado por `scripts/baixar_populacao_ibge.py`). O IBGE não publica estimativa
-    municipal para 2022 nem para 2023, então:
-
-    - 2022 usa a contagem do Censo 2022 (`v0001` somado por município, vindo de
-      `censo`, a saída de `tcc.mj.carregar_censo_por_municipio`);
-    - 2023 é a média entre o Censo 2022 e a estimativa de 2024 (interpolação
-      linear); onde só um dos dois existe, fica esse.
+    municipal para 2022 nem para 2023, então os dois anos usam a contagem do
+    Censo 2022 (`v0001` somado por município, vindo de `censo`, a saída de
+    `tcc.mj.carregar_censo_por_municipio`).
     """
     estimada = pl.read_csv(
         POPULACAO_ESTIMADA_CSV, schema_overrides={"cod_municipio": pl.String}
@@ -65,24 +63,11 @@ def populacao_municipal_por_ano(anos: list[int], censo: pl.DataFrame) -> pl.Data
     )
     do_censo = censo.select(
         pl.col("cd_mun").str.slice(0, 6).alias("codigo_municipio"),
-        pl.lit(ANO_CENSO, pl.Int64).alias("ano"),
+        pl.lit(list(ANOS_COM_CENSO), pl.List(pl.Int64)).alias("ano"),
         pl.col("v0001").cast(pl.Int64).alias("populacao"),
         pl.lit("Censo 2022").alias("fonte_populacao"),
-    )
-    base = pl.concat([estimada, do_censo])
-
-    p22 = base.filter(pl.col("ano") == ANO_CENSO).select("codigo_municipio", p22="populacao")
-    p24 = base.filter(pl.col("ano") == 2024).select("codigo_municipio", p24="populacao")
-    interpolada = (
-        p22.join(p24, on="codigo_municipio", how="full", coalesce=True)
-        .select(
-            "codigo_municipio",
-            pl.lit(2023, pl.Int64).alias("ano"),
-            pl.mean_horizontal("p22", "p24").round().cast(pl.Int64).alias("populacao"),
-            pl.lit("interpolação Censo 2022–estimativa 2024").alias("fonte_populacao"),
-        )
-    )
-    return pl.concat([base, interpolada]).filter(pl.col("ano").is_in(anos))
+    ).explode("ano")
+    return pl.concat([estimada, do_censo]).filter(pl.col("ano").is_in(anos))
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +101,8 @@ def populacao_ra_por_ano(populacao_df: pl.DataFrame) -> pl.DataFrame:
         censo.join(populacao_df.rename({"populacao": "populacao_df"}), how="cross")
         .with_columns(
             (pl.col("populacao") / total_censo * pl.col("populacao_df")).alias("populacao"),
-            # Em 2022 o rateio devolve a própria contagem do Censo na RA.
-            pl.when(pl.col("ano") == ANO_CENSO).then(pl.col("fonte_populacao"))
+            # Em 2022 e 2023 o rateio devolve a própria contagem do Censo na RA.
+            pl.when(pl.col("ano").is_in(ANOS_COM_CENSO)).then(pl.col("fonte_populacao"))
             .otherwise(pl.col("fonte_populacao")
                        + " do DF, rateada pela participação da RA no Censo 2022")
             .alias("fonte_populacao"),
