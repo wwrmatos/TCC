@@ -11,7 +11,7 @@ Faz, para todos os anos de `ssp_df_ra_consolidado.csv` (gerado por
   Censo 2022;
 - a linha do DF inteiro (`ra_numero` 0, sem `cd_subdist`), com a população do
   DF no ano, e as colunas `contagem`, `fonte` e `arquivo` do consolidado;
-- os feminicídios por RA dos estudos da CTMHF (2023–2026)
+- os feminicídios por RA dos estudos da CTMHF (2021–2026)
   (`ssp_df_feminicidio_ra.csv`, de `scripts/extrair_feminicidio_ctmhf.py`), no
   eixo próprio `5. FEMINICÍDIO - CTMHF`, só até o último mês dos balanços de
   cada ano, para o ano corrente cobrir os mesmos meses das outras naturezas.

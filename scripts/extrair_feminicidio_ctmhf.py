@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["polars>=1.30", "pdfplumber>=0.11"]
+# dependencies = ["polars>=1.30", "pdfplumber>=0.11", "scipy>=1.13"]
 # ///
 """Extrai os feminicídios por RA e mês dos estudos mensais da Câmara Técnica de
 Monitoramento de Homicídios e Feminicídios (CTMHF/SSP-DF), salvos em
@@ -10,14 +10,15 @@ Os anos saem dos próprios estudos: entra todo ano com estudo de quase todos os
 meses (ver :data:`MESES_FALTANDO_MAX`), porque o mês de cada caso vem da
 diferença entre estudos seguidos. Os anos anteriores já chegam fechados no
 primeiro estudo, sem como saber o mês dos casos de cada RA, e ficam de fora.
-Estudos sem a tabela de casos por mês × ano (de maio/2021 a fevereiro/2023, só
-há um gráfico que soma todos os anos) são ignorados.
+Os estudos de janeiro/2021 a fevereiro/2023 trazem a tabela por RA × ano, mas
+não a de casos por mês × ano; em 2021 e 2022, o mês sai do estudo em que cada
+caso apareceu (ver :func:`reconstruir_por_entrada`).
 
 Cada estudo é acumulado (março de 2015 até o fim do mês do estudo) e traz duas
 tabelas que interessam aqui:
 
 - TABELA 03, casos por mês × ano (o DF inteiro);
-- TABELA 04, casos por RA × ano.
+- TABELA 04, casos por RA × ano (TABELA 03 ou 04 nos estudos até 2023).
 
 Nenhuma traz RA × mês. O mês de cada caso por RA é reconstruído pela diferença
 entre estudos consecutivos: o que entra na TABELA 04 de um estudo para o outro
@@ -65,6 +66,7 @@ from pathlib import Path
 
 import pdfplumber
 import polars as pl
+from scipy.optimize import linear_sum_assignment
 
 RAIZ = Path(__file__).resolve().parents[1]
 ESTUDOS_DIR = RAIZ / "data" / "dados_ssp_df" / "feeminicidio"
@@ -106,6 +108,13 @@ RA_DA_CTMHF: dict[str, int] = {
     "ARAPOANGA": 6, "AGUA QUENTE": 15,
 }
 
+# Começo de rótulos (sem acento, caixa alta) que não casam com o nome de
+# RA_DA_CTMHF nem pelo começo, como os de alguns estudos de 2022.
+APELIDOS: dict[str, str] = {
+    "SIA (": "SIA",
+    "SOL NASCENTE / P": "POR DO SOL / SOL NASCENTE",
+}
+
 _NUMERO = re.compile(r"^(\d+|-)$")
 
 
@@ -140,26 +149,53 @@ def _linhas(page) -> list[list[dict]]:
     return [sorted(ws, key=lambda w: w["x0"]) for _, ws in linhas]
 
 
+def _sem_sobreposicao(page, ws: list[dict]) -> list[dict]:
+    """A linha `ws` refeita só com os caracteres do tamanho do primeiro. Em
+    alguns estudos de 2022 o rodapé ("CTHMF / SSPDF - 2022", em fonte menor) cai
+    sobre a linha "Total geral" e as letras se misturam aos números."""
+    topo = ws[0]["top"]
+    tamanho = min((c for c in page.chars if abs(c["top"] - topo) <= 4),
+                  key=lambda c: c["x0"])["size"]
+    filtrada = page.filter(lambda o: o.get("object_type") != "char"
+                           or abs(o["top"] - topo) > 4 or abs(o["size"] - tamanho) < 0.1)
+    return next(l for l in _linhas(filtrada) if abs(l[0]["top"] - topo) <= 4)
+
+
 def _numeros(ws: list[dict]) -> list[int]:
     return [0 if w["text"] == "-" else int(w["text"]) for w in ws]
 
 
 def _tabela_ra(page, n_anos: int) -> tuple[dict[str, list[int]], list[int]]:
-    """TABELA 04: linhas com o rótulo da RA à esquerda e uma célula por ano mais
-    o total ("-" é zero). Devolve RA → valores e a linha "Total geral"."""
+    """Tabela de casos por RA × ano: linhas com o rótulo da RA (às vezes
+    precedido do número dela) e uma célula por ano mais o total ("-" é zero).
+    Em 2021 a tabela das taxas fica ao lado, na mesma linha: só vale a primeira
+    sequência de números depois do rótulo. Devolve RA → valores e a linha
+    "Total geral"."""
     corpo, total = {}, None
     for ws in _linhas(page):
-        celulas = [w for w in ws if w["x0"] > 100 and _NUMERO.match(w["text"])]
-        if len(celulas) != n_anos + 1:
+        if ws[0]["text"] == "Total":
+            ws = _sem_sobreposicao(page, ws)
+        textos = [w["text"] for w in ws]
+        numero = None
+        if len(textos) > 1 and textos[0].isdigit() and not _NUMERO.match(textos[1]):
+            numero, textos = int(textos[0]), textos[1:]
+        i = next((i for i, t in enumerate(textos) if _NUMERO.match(t)), len(textos))
+        j = next((j for j in range(i, len(textos)) if not _NUMERO.match(textos[j])), len(textos))
+        if i == 0 or j - i < n_anos + 1:
             continue
-        rotulo = " ".join(w["text"] for w in ws if w["x0"] < 100)
+        rotulo = " ".join(textos[:i])
+        celulas = _numeros([{"text": t} for t in textos[i:i + n_anos + 1]])
         if rotulo.startswith("Total"):
-            total = _numeros(celulas)
-        else:
-            ra = _casar(rotulo, list(RA_DA_CTMHF))
-            if ra is None:
-                raise ValueError(f"RA desconhecida na TABELA 04: {rotulo!r}")
-            corpo[ra] = _numeros(celulas)
+            total = celulas
+            continue
+        # Rótulos cortados ("Riacho Fun…") só se distinguem pelo número da RA.
+        nomes = [n for n, k in RA_DA_CTMHF.items() if numero in (None, k)]
+        chave = _sem_acento(rotulo).upper()
+        rotulo = next((n for a, n in APELIDOS.items() if chave.startswith(a)), rotulo)
+        ra = _casar(rotulo, nomes)
+        if ra is None:
+            raise ValueError(f"RA desconhecida na tabela por RA: {rotulo!r}")
+        corpo[ra] = celulas
     return corpo, total
 
 
@@ -186,45 +222,66 @@ def _tabela_mes(page, n_anos: int) -> tuple[dict[int, list[int]], list[int]]:
 
 
 class EstudoSemTabelas(Exception):
-    """O estudo não tem, no formato esperado, as tabelas de que a reconstrução
-    precisa (de maio/2021 a 2022, por exemplo, não há a de casos por mês × ano)."""
+    """O estudo não tem, no formato esperado, o período ou a tabela por RA."""
+
+
+def _periodo(pdf) -> tuple[int, int]:
+    """Ano e mês do fim do estudo: da capa ("acumulado: março de 2015 a agosto
+    de 2022", às vezes com as letras espaçadas) ou, quando a capa só diz o ano,
+    da apresentação ("... e o dia 30 do mês de setembro de 2021")."""
+    capa = re.sub(r"\s+", "", pdf.pages[0].extract_text() or "")
+    m = re.search(r"acumulado:?mar.ode2015a(\D+?)de(20\d\d)", capa, re.IGNORECASE)
+    if not m:
+        for page in pdf.pages[1:4]:
+            texto = " ".join((page.extract_text() or "").split())
+            m = re.search(r"dia \d+ do m.s de (\S+) de (20\d\d)", texto, re.IGNORECASE)
+            if m:
+                break
+    if not m:
+        raise EstudoSemTabelas("período do estudo não encontrado")
+    mes = _casar(m.group(1), MESES_EXTENSO)
+    if mes is None:
+        raise EstudoSemTabelas(f"mês do período ilegível: {m.group(1)!r}")
+    return int(m.group(2)), MESES_EXTENSO.index(mes) + 1
 
 
 def ler_estudo(path: Path) -> dict:
-    """Período do estudo e as TABELAS 03 e 04, conferidas pelos totais."""
+    """Período do estudo, a tabela de casos por RA × ano e, quando há, a TABELA
+    03 (casos por mês × ano), conferidas pelos totais. Sem a TABELA 03, `mes`
+    fica vazio."""
     with pdfplumber.open(path) as pdf:
-        capa = pdf.pages[0].extract_text() or ""
-        m = re.search(r"acumulado:?\s+mar.o de 2015 a (\S+) de (20\d\d)", capa, re.IGNORECASE)
-        if not m:
-            raise EstudoSemTabelas("período do estudo não encontrado na capa")
-        mes_fim = MESES_EXTENSO.index(_casar(m.group(1), MESES_EXTENSO)) + 1
-        ano_fim = int(m.group(2))
+        ano_fim, mes_fim = _periodo(pdf)
         n_anos = ano_fim - 2015 + 1
         pag_ra = pag_mes = None
         for page in pdf.pages:
             texto = page.extract_text() or ""
             if "TABELA 03. QUANTIDADE DE CASOS" in texto:
                 pag_mes = page
-            if re.search(r"TABELA 04\. TOTAL DE .* POR RA - 2015 A " + str(ano_fim), texto):
+            if re.search(r"TABELA 0\d\. TOTAL DE .* POR RA - 2015 A " + str(ano_fim), texto):
                 pag_ra = page
-        if pag_ra is None or pag_mes is None:
-            raise EstudoSemTabelas("sem a tabela de casos por mês × ano ou por RA × ano")
+        if pag_ra is None:
+            raise EstudoSemTabelas("sem a tabela de casos por RA × ano")
         try:
             por_ra, total_ra = _tabela_ra(pag_ra, n_anos)
-            por_mes, total_mes = _tabela_mes(pag_mes, n_anos)
+            por_mes, total_mes = _tabela_mes(pag_mes, n_anos) if pag_mes else ({}, None)
         except ValueError as e:
             raise ValueError(f"{path}: {e}") from e
 
     soma_ra = [sum(c) for c in zip(*por_ra.values())]
-    soma_mes = [sum(c) for c in zip(*por_mes.values())]
-    if len(por_mes) != 12 or not (soma_ra == total_ra == soma_mes == total_mes):
-        raise ValueError(f"{path}: as TABELAS 03 e 04 não fecham ({total_ra} × {total_mes})")
+    if soma_ra != total_ra:
+        raise ValueError(f"{path}: a tabela por RA não fecha ({soma_ra} × {total_ra})")
+    if pag_mes:
+        soma_mes = [sum(c) for c in zip(*por_mes.values())]
+        if len(por_mes) != 12 or not (soma_ra == soma_mes == total_mes):
+            raise ValueError(f"{path}: as tabelas por RA e por mês não fecham "
+                             f"({total_ra} × {total_mes})")
     anos = range(2015, ano_fim + 1)
     return {
         "arquivo": path.relative_to(ESTUDOS_DIR).as_posix(),
         "fim": (ano_fim, mes_fim),
         "ra": {a: {ra: v[i] for ra, v in por_ra.items() if v[i]} for i, a in enumerate(anos)},
-        "mes": {a: {mes: v[i] for mes, v in por_mes.items() if v[i]} for i, a in enumerate(anos)},
+        "mes": {a: {mes: v[i] for mes, v in por_mes.items() if v[i]} for i, a in enumerate(anos)}
+               if pag_mes else {},
     }
 
 
@@ -285,7 +342,7 @@ def reconstruir(estudos: list[dict], ano: int) -> tuple[Estado, set[tuple[str, i
     estados: dict[Estado, int] = {(): 0}  # estado → casos removidos até aqui
     entrada: dict[tuple[str, int], str] = {}
     for estudo in estudos:
-        if ano not in estudo["ra"]:
+        if ano not in estudo["mes"]:
             continue
         candidatos: dict[Estado, int] = {}
         for estado, custo in estados.items():
@@ -303,6 +360,53 @@ def reconstruir(estudos: list[dict], ano: int) -> tuple[Estado, set[tuple[str, i
     celulas = set().union(*contagens)
     incertas = {c for c in celulas if len({cnt[c] for cnt in contagens}) > 1}
     return finais[0], incertas, entrada
+
+
+# Peso de datar um caso depois do estudo em que ele apareceu (só uma revisão
+# explica isso), contra 1 por mês de antecedência.
+CUSTO_DEPOIS = 100
+
+
+def reconstruir_por_entrada(estudos: list[dict], ano: int
+                            ) -> tuple[Estado, set[tuple[int, int]], dict]:
+    """Como :func:`reconstruir`, para os anos em que nenhum estudo do próprio
+    ano traz a TABELA 03 (2021 e 2022). Cada caso novo de uma RA, de um estudo
+    para o seguinte, recebe o mês do estudo em que apareceu; um caso que sai
+    leva o mais recente da RA. No fim, os meses são ajustados à TABELA 03 do
+    último estudo (`estudos[-1]`) com o menor deslocamento total: um caso pode
+    ter acontecido antes do estudo em que apareceu (registro tardio), quase
+    nunca depois. Fica incerto o caso que muda de mês e, quando o deslocado
+    poderia ser outro, os que apareceram com ele em outras RAs."""
+    entradas: dict[str, list[tuple[int, str]]] = {}  # RA → (mês de entrada, estudo)
+    for e in estudos:
+        if ano not in e["ra"]:
+            continue
+        # Meses contados a partir de janeiro do ano: 13 é o estudo de janeiro seguinte.
+        mes_entrada = (e["fim"][0] - ano) * 12 + e["fim"][1]
+        for ra in set(entradas) | set(e["ra"][ano]):
+            casos = entradas.setdefault(ra, [])
+            n = e["ra"][ano].get(ra, 0)
+            del casos[n:]
+            casos.extend([(mes_entrada, e["arquivo"])] * (n - len(casos)))
+
+    casos = [(ra, ent, arq) for ra, lista in entradas.items() for ent, arq in lista]
+    vagas = [m for m, n in sorted(estudos[-1]["mes"][ano].items()) for _ in range(n)]
+    custo = [[ent - m if m <= ent else CUSTO_DEPOIS * (m - ent) for m in vagas]
+             for _, ent, _ in casos]
+    linhas, colunas = linear_sum_assignment(custo)
+
+    final, entrada, grupos = [], {}, {}
+    for li, co in zip(linhas, colunas):
+        ra, ent, arq = casos[li]
+        mes = vagas[co]
+        final.append((ra, mes))
+        entrada.setdefault((ra, mes), arq)
+        grupos.setdefault(ent, []).append((RA_DA_CTMHF[ra], mes, mes != ent))
+    incertas = set()
+    for membros in grupos.values():
+        trocavel = any(m for *_, m in membros) and len({ra for ra, *_ in membros}) > 1
+        incertas |= {(ra, mes) for ra, mes, movido in membros if movido or trocavel}
+    return tuple(sorted(final)), incertas, entrada
 
 
 # Casos de diferença tolerados, num ano, entre o estudo usado e o MJ (soma das
@@ -397,7 +501,9 @@ def main() -> None:
         if dif:
             print(f"{ano}: nenhum estudo bate com o MJ mês a mês; o mais próximo "
                   f"({ultimo['arquivo']}) difere em {dif} caso(s), dentro da tolerância")
-        final, incertas, entrada = reconstruir(estudos[: i + 1], ano)
+        com_tabela_mes = any(e["fim"][0] == ano and ano in e["mes"] for e in estudos)
+        metodo = reconstruir if com_tabela_mes else reconstruir_por_entrada
+        final, incertas, entrada = metodo(estudos[: i + 1], ano)
         por_ra = Counter(ra for ra, _ in final)
         por_mes = Counter(mes for _, mes in final)
         if por_ra != Counter(ultimo["ra"][ano]) or por_mes != Counter(ultimo["mes"][ano]):

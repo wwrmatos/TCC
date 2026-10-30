@@ -1504,9 +1504,7 @@ def _registrar_ssp(app: Dash, ssp: BaseSSP) -> None:
             avisos.append((
                 f"O feminicídio por RA vem dos estudos da CTMHF/SSP-DF ({_faixas(anos_fem)}),",
                 "não dos balanços: são os casos que o sistema de justiça confirma como "
-                "feminicídio consumado. O mês de alguns casos foi reconstruído pela diferença "
-                "entre estudos mensais e pode estar trocado entre meses próximos; os totais por "
-                "RA e ano são os do estudo. A soma do DF pode diferir da aba Brasil (MJ) em "
+                "feminicídio consumado. A soma do DF pode diferir da aba Brasil (MJ) em "
                 "até 3 casos por ano.",
             ))
         mes_fim_txt = MESES_EXTENSO[ssp.ultimo_mes[a1] - 1]

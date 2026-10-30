@@ -83,7 +83,7 @@ Lê as bases finais `data/processed/mj_censo_geo.parquet` (gerada por
   comparação anual da taxa do DF, mapa de calor RA × ano e tabela. Taxa por mil
   habitantes; com vários anos, é a média anual. Os totais do DF são a soma das
   RAs, não o balanço do DF, que separa naturezas (feminicídio, estupro de
-  vulnerável) que o das RAs não separa. De 2023 a 2026, o feminicídio por RA vem
+  vulnerável) que o das RAs não separa. De 2021 a 2026, o feminicídio por RA vem
   dos estudos da CTMHF (ver abaixo), num eixo à parte e fora do padrão, porque
   já está contado no HOMICÍDIO. Nos anos e meses em que nenhuma das naturezas
   escolhidas existe (feminicídio sozinho antes de 2025, por exemplo), a série
@@ -173,7 +173,7 @@ cabeçalho de cada um, então rodam com `uv run --script`):
 uvx playwright install chromium                  # só na primeira vez
 uv run --script scripts/baixar_ssp_ra.py         # baixa PDFs/planilhas → data/ssp_df_ra_bruto/
 uv run --script scripts/consolidar_ssp_ra.py     # junta tudo → data/processed/ssp_df_ra_consolidado.csv
-uv run --script scripts/extrair_feminicidio_ctmhf.py  # feminicídios por RA 2023–2026 → data/processed/ssp_df_feminicidio_ra.csv (depois de consolidar_mj.py)
+uv run --script scripts/extrair_feminicidio_ctmhf.py  # feminicídios por RA 2021–2026 → data/processed/ssp_df_feminicidio_ra.csv (depois de consolidar_mj.py)
 uv run python scripts/consolidar_ssp.py          # + dimensões, delegacias e população → data/processed/ssp_ra_geo.parquet
 ```
 
@@ -273,7 +273,7 @@ do link:
   removidos.
 - **Arniqueira e Sol Nascente/Pôr do Sol** só têm dados a partir de 2020.
 
-#### Feminicídio por RA (CTMHF, 2023–2026)
+#### Feminicídio por RA (CTMHF, 2021–2026)
 
 Os balanços das RAs não separam o feminicídio do HOMICÍDIO. Para tê-lo por RA,
 `extrair_feminicidio_ctmhf.py` lê os estudos mensais da Câmara Técnica de
@@ -286,15 +286,22 @@ antigos (um caso deixa de ser feminicídio, muda de RA ou de mês), e a
 reconstrução usa o menor número de revisões que explica cada estudo.
 
 - **Anos cobertos.** Entra o ano que tem estudo de quase todos os meses (podem
-  faltar até 2). De maio/2021 a fevereiro/2023, os estudos não trazem a tabela
-  por mês × ano, só um gráfico "mês do fato" que soma todos os anos, e são
-  ignorados; por isso 2021 e 2022 ficam de fora, e 2023 começa no estudo de
-  março (os casos de janeiro a março entram juntos). De 2015 a 2020 não há como
-  separar o mês dos casos de cada RA.
+  faltar até 2): 2021 a 2026. De 2015 a 2020 não há estudos mensais, e não há
+  como separar o mês dos casos de cada RA.
+- **2021 e 2022.** Os estudos de janeiro/2021 a fevereiro/2023 trazem a tabela
+  por RA × ano (em layouts que mudam ao longo do período), mas não a TABELA 03
+  por mês × ano. Nesses dois anos, cada caso novo de uma RA recebe o mês do
+  estudo em que apareceu, e os meses são depois ajustados à TABELA 03 do estudo
+  de referência (abaixo) com o menor deslocamento: um caso pode ser anterior ao
+  estudo em que apareceu (registro tardio), quase nunca posterior. De 2023 em
+  diante, a reconstrução usa a TABELA 03 de cada estudo, e os estudos de
+  janeiro e fevereiro/2023 não entram (os casos de janeiro a março entram
+  juntos).
 
 - **Mês incerto.** Quando um estudo traz casos novos de RAs diferentes em meses
-  diferentes, a combinação RA × mês não fica determinada. São 24 dos 97 casos
-  (12 em 2023, pelo começo em março; 4 em 2024; 3 em 2025; 5 em 2026), marcados
+  diferentes, a combinação RA × mês não fica determinada; em 2021 e 2022, também
+  o caso que o ajuste muda de mês. São 43 dos 139 casos (9 em 2021; 10 em 2022;
+  12 em 2023, pelo começo em março; 4 em 2024; 3 em 2025; 5 em 2026), marcados
   com `mes_incerto` em
   `data/processed/ssp_df_feminicidio_casos.csv`. Os totais por RA × ano e por
   mês no DF são exatamente os do estudo usado.
@@ -307,7 +314,8 @@ reconstrução usa o menor número de revisões que explica cada estudo.
   setembro/2026). Sem nenhum igual, usa o que menos difere, se a diferença for
   de até 3 casos no ano, somando as diferenças de cada mês (`TOLERANCIA_MJ`);
   acima disso, o ano fica de fora. 2023 usa o estudo de outubro/2025 e tem 30
-  casos contra 31 no MJ (um caso em maio, e não junho, e um de outubro a menos).
+  casos contra 31 no MJ (um caso em maio, e não junho, e um de outubro a menos);
+  2021 usa o de setembro/2024 e 2022, o de fevereiro/2025, ambos a 2 casos do MJ.
   `consolidar_ssp.py` repete a conferência com o mesmo limite e para com erro
   acima dele. Por isso `extrair_feminicidio_ctmhf.py` roda depois de
   `consolidar_mj.py`.
@@ -348,7 +356,7 @@ scripts/
   juntar_dimensoes.py  # anexa município/UF/região às bases finais
   baixar_ssp_ra.py     # scraper (Playwright) dos balanços da SSP-DF por RA, 2015–2026
   consolidar_ssp_ra.py # junta os PDFs/planilhas baixados num CSV único
-  extrair_feminicidio_ctmhf.py  # feminicídios por RA e mês (2023–2026) dos estudos da CTMHF
+  extrair_feminicidio_ctmhf.py  # feminicídios por RA e mês (2021–2026) dos estudos da CTMHF
   baixar_populacao_ibge.py  # estimativas anuais de população por município (SIDRA)
   consolidar_mj.py     # BancoVDE 2016–2026 + Censo + dimensões + população do ano
   consolidar_ssp.py    # série da SSP-DF 2015–2026 + dimensões + delegacias + população do ano

@@ -22,7 +22,7 @@ MJ_CENSO_GEO_PARQUET = PROCESSED_DIR / "mj_censo_geo.parquet"
 # mesma série junta às dimensões, às delegacias e à população do ano.
 SSP_RA_CONSOLIDADO_CSV = PROCESSED_DIR / "ssp_df_ra_consolidado.csv"
 SSP_RA_GEO_PARQUET = PROCESSED_DIR / "ssp_ra_geo.parquet"
-# Feminicídios por RA e mês, 2023–2026, dos estudos da CTMHF/SSP-DF
+# Feminicídios por RA e mês, 2021–2026, dos estudos da CTMHF/SSP-DF
 # (scripts/extrair_feminicidio_ctmhf.py).
 SSP_FEMINICIDIO_RA_CSV = PROCESSED_DIR / "ssp_df_feminicidio_ra.csv"
 

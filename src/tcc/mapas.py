@@ -26,7 +26,7 @@ from tcc.populacao import BASE_TAXA
 # é circular. Ficam disponíveis no painel, apenas desmarcados por padrão.
 EIXO_FORA_DA_TAXA = "4."
 
-# Prefixo do eixo dos feminicídios por RA da CTMHF (2023–2026). O HOMICÍDIO dos
+# Prefixo do eixo dos feminicídios por RA da CTMHF (2021–2026). O HOMICÍDIO dos
 # balanços das RAs já inclui os feminicídios, então somar os dois contaria cada
 # caso duas vezes. Fica disponível no painel, desmarcado por padrão.
 EIXO_JA_EM_HOMICIDIO = "5."
