@@ -34,6 +34,23 @@ uv sync                              # cria o .venv e instala tudo, incl. o paco
 uv run python scripts/gerar_mapas.py --abrir
 ```
 
+### Pipeline completo
+
+```bash
+uv run python scripts/pipeline.py          # roda, na ordem, só o que estiver desatualizado
+uv run python scripts/pipeline.py --dry-run   # mostra o que rodaria e por quê
+```
+
+`pipeline.py` encadeia os scripts das seções abaixo (estimativas do IBGE →
+balanços da SSP-DF → `consolidar_ssp_ra` → `consolidar_mj` → feminicídio da
+CTMHF → `consolidar_ssp` → mapas). Como num `make`, uma etapa roda quando falta
+uma saída ou quando uma entrada — dados, o próprio script ou os módulos de
+`tcc` que ele usa — é mais nova que ela; refazer uma etapa refaz as seguintes.
+Os downloads só rodam se a saída não existe ou com `--baixar`. Também dá para
+pedir etapas pelo nome (`pipeline.py mj feminicidio`) ou refazer tudo com
+`--forcar`. Os scripts de um ano só (`juntar_mj_censo.py`,
+`juntar_dimensoes.py`) ficam de fora.
+
 ### Painel (Dash)
 
 ```bash
@@ -351,6 +368,7 @@ src/tcc/          # pacote com toda a lógica reutilizável
   malhas.py       # malhas de UF/município do IBGE, com cache em data/malhas/
   painel/         # painel Dash (dados.py: carga das bases; app.py: layout e callbacks)
 scripts/
+  pipeline.py     # roda todas as etapas abaixo, na ordem, só o que mudou
   gerar_mapas.py  # ponto de entrada reproduzível
   painel.py       # sobe o painel Dash
   juntar_dimensoes.py  # anexa município/UF/região às bases finais
